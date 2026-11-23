@@ -1,0 +1,176 @@
+name: Build Standalone Android APK
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Prepare 100% offline standalone app bundle (HTML + Standards + Tailwind + 57 Studio MP3s)
+        run: |
+          rm -rf /tmp/android-app
+          mkdir -p /tmp/android-app/www/soundfonts
+          cp index.html /tmp/android-app/www/
+          cp -r public/. /tmp/android-app/www/
+
+          # 1. Pobierz lokalną kopię Tailwind Play JS, by aplikacja miała pełny wygląd 100% offline
+          curl -fsSL "https://cdn.tailwindcss.com" -o /tmp/android-app/www/tailwind-play.js
+
+          # 2. Pobierz wszystkie 57 próbek studyjnych MP3 (6 instrumentów) prosto do wnętrza APK
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const base = "https://gleitz.github.io/midi-js-soundfonts/MusyngKite/";
+            const notes = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+            const instruments = [
+              { folder: "electric_guitar_jazz-mp3", midis: [45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81] },
+              { folder: "electric_guitar_clean-mp3", midis: [45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81] },
+              { folder: "acoustic_bass-mp3", midis: [36, 39, 42, 45, 48, 51, 54] },
+              { folder: "drawbar_organ-mp3", midis: [48, 51, 54, 57, 60, 63, 66, 69] },
+              { folder: "electric_piano_1-mp3", midis: [48, 51, 54, 57, 60, 63, 66, 69] },
+              { folder: "acoustic_guitar_steel-mp3", midis: [48, 51, 54, 57, 60, 63, 66, 69] }
+            ];
+            (async () => {
+              let count = 0;
+              for (const inst of instruments) {
+                const dir = path.join("/tmp/android-app/www/soundfonts", inst.folder);
+                fs.mkdirSync(dir, { recursive: true });
+                await Promise.all(inst.midis.map(async (midi) => {
+                  const noteName = notes[midi % 12] + (Math.floor(midi / 12) - 1);
+                  const url = `${base}${inst.folder}/${noteName}.mp3`;
+                  const res = await fetch(url);
+                  if (!res.ok) throw new Error(`Failed ${url}: ${res.status}`);
+                  const buf = Buffer.from(await res.arrayBuffer());
+                  fs.writeFileSync(path.join(dir, `${noteName}.mp3`), buf);
+                  count++;
+                }));
+              }
+              console.log(`Bundled ${count} studio MP3 samples into APK.`);
+            })();
+          '
+
+          # 3. Przełącz index.html w paczce APK na lokalny Tailwind i lokalne próbki MP3
+          node -e '
+            const fs = require("fs");
+            const p = "/tmp/android-app/www/index.html";
+            let html = fs.readFileSync(p, "utf8");
+            const replacement = "<script>window.__IS_ANDROID_APK__=true;window.__LOCAL_SOUNDFONTS__=true;</script>\n  <script src=\"./tailwind-play.js\"></script>";
+            if (!html.includes("https://cdn.tailwindcss.com")) {
+              throw new Error("Tailwind script tag not found in index.html");
+            }
+            html = html.replace("<script src=\"https://cdn.tailwindcss.com\"></script>", replacement);
+            fs.writeFileSync(p, html, "utf8");
+            console.log("Patched APK index.html for 100% standalone offline execution.");
+          '
+
+      - name: Initialize Capacitor Android project
+        working-directory: /tmp/android-app
+        run: |
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.jazzfretboard.lab",
+            "appName": "Jazz Fretboard Lab",
+            "webDir": "www",
+            "backgroundColor": "#020617",
+            "server": {
+              "androidScheme": "https"
+            },
+            "android": {
+              "backgroundColor": "#020617"
+            }
+          }
+          EOF
+          npx cap add android
+          npx cap sync android
+
+      - name: Apply Jazz Fretboard Lab Android launcher icons and theme
+        working-directory: /tmp/android-app
+        run: |
+          # Bezpieczna podmiana koloru tła ikony adaptacyjnej bez ryzyka duplikacji zasobów Androida
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const valuesDir = "android/app/src/main/res/values";
+            fs.mkdirSync(valuesDir, { recursive: true });
+            const files = fs.readdirSync(valuesDir).filter(f => f.endsWith(".xml"));
+            let updated = false;
+            for (const f of files) {
+              const full = path.join(valuesDir, f);
+              const content = fs.readFileSync(full, "utf8");
+              if (content.includes("name=\"ic_launcher_background\"")) {
+                const next = content.replace(/(name="ic_launcher_background"[^>]*>)[^<]*(<)/g, "$1#020617$2");
+                fs.writeFileSync(full, next, "utf8");
+                updated = true;
+              }
+            }
+            if (!updated) {
+              fs.writeFileSync(
+                path.join(valuesDir, "ic_launcher_background.xml"),
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n    <color name=\"ic_launcher_background\">#020617</color>\n</resources>\n",
+                "utf8"
+              );
+            }
+            console.log("Updated Android launcher background color cleanly.");
+          '
+
+          # Podmień domyślne ikony Capacitora na ikony Jazz Fretboard Lab
+          for dir in android/app/src/main/res/mipmap-*; do
+            if [ -f "$dir/ic_launcher.png" ]; then
+              cp www/pwa-512x512.png "$dir/ic_launcher.png"
+            fi
+            if [ -f "$dir/ic_launcher_round.png" ]; then
+              cp www/pwa-512x512.png "$dir/ic_launcher_round.png"
+            fi
+            if [ -f "$dir/ic_launcher_foreground.png" ]; then
+              cp www/pwa-maskable-512x512.png "$dir/ic_launcher_foreground.png"
+            fi
+          done
+
+      - name: Compile standalone signed Android APK
+        working-directory: /tmp/android-app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/JazzFretboardLab-Android.apk"
+          ls -lh "$GITHUB_WORKSPACE/JazzFretboardLab-Android.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JazzFretboardLab-Android-APK
+          path: JazzFretboardLab-Android.apk
+          retention-days: 90
+
+      - name: Publish direct-download Android APK Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view android-apk >/dev/null 2>&1; then
+            gh release upload android-apk JazzFretboardLab-Android.apk --clobber
+          else
+            gh release create android-apk JazzFretboardLab-Android.apk \
+              --title "Jazz Fretboard Lab — Niezależna aplikacja Android (.apk)" \
+              --notes "Niezależna aplikacja Android (100% offline, bez otwierania przeglądarki ani github.com). Zawiera bazę 1460 standardów, pełny silnik audio oraz wszystkie 57 próbek studyjnych MP3 wbudowane wewnątrz pliku .apk."
+          fi

@@ -2389,6 +2389,7 @@
 
     // --- BIBLIOTEKA PRAWDZIWYCH PRÓBEK STUDYJNYCH (MUSYNGKITE SOUNDFONT MULTI-SAMPLES) ---
     const SOUNDFONT_CDN_BASE = 'https://gleitz.github.io/midi-js-soundfonts/MusyngKite/';
+    const USE_LOCAL_SOUNDFONTS = Boolean(window.__LOCAL_SOUNDFONTS__);
     const SOUNDFONT_NOTE_NAMES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
 
     function midiToSoundfontName(midi) {
@@ -2444,12 +2445,28 @@
       }
 
       const noteName = midiToSoundfontName(midi);
-      const url = `${SOUNDFONT_CDN_BASE}${cfg.folder}/${noteName}.mp3`;
-      const p = fetch(url, { mode: 'cors' })
-        .then((res) => {
+      const localUrl = `./soundfonts/${cfg.folder}/${noteName}.mp3`;
+      const cdnUrl = `${SOUNDFONT_CDN_BASE}${cfg.folder}/${noteName}.mp3`;
+
+      const loadSample = () => {
+        if (USE_LOCAL_SOUNDFONTS) {
+          return fetch(localUrl).then((res) => {
+            if (!res.ok) throw new Error(`Local HTTP ${res.status}`);
+            return res.arrayBuffer();
+          }).catch(() =>
+            fetch(cdnUrl, { mode: 'cors' }).then((res) => {
+              if (!res.ok) throw new Error(`CDN HTTP ${res.status}`);
+              return res.arrayBuffer();
+            })
+          );
+        }
+        return fetch(cdnUrl, { mode: 'cors' }).then((res) => {
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           return res.arrayBuffer();
-        })
+        });
+      };
+
+      const p = loadSample()
         .then((buf) => {
           studioSampleEngine.rawBytes[instKey][midi] = buf;
           delete studioSampleEngine.inFlightFetch[instKey][midi];
@@ -6133,11 +6150,15 @@
       }
     });
 
-    // Sprawdzenie czy aplikacja uruchomiona jest w trybie standalone
-    const isStandalone = window.matchMedia('(display-mode: standalone)').matches ||
+    // Sprawdzenie czy aplikacja uruchomiona jest jako natywne APK Android lub zainstalowane PWA
+    const isNativeAndroidApk = Boolean(window.Capacitor || window.__IS_ANDROID_APK__);
+    const isStandalone = isNativeAndroidApk ||
+      window.matchMedia('(display-mode: standalone)').matches ||
       (window.navigator.standalone === true);
 
-    if (isStandalone && pwaInstallBtnText) {
+    if (isNativeAndroidApk && pwaInstallBtn) {
+      pwaInstallBtn.classList.add('hidden');
+    } else if (isStandalone && pwaInstallBtnText) {
       pwaInstallBtnText.textContent = '✓ Zainstalowano';
       if (pwaInstallBtn) {
         pwaInstallBtn.classList.remove('from-emerald-600', 'to-teal-600');
@@ -6189,7 +6210,7 @@
     // Monitor stanu offline
     function updateOnlineStatus() {
       if (offlineIndicator) {
-        if (!navigator.onLine) {
+        if (!navigator.onLine && !isNativeAndroidApk) {
           offlineIndicator.classList.remove('hidden');
         } else {
           offlineIndicator.classList.add('hidden');
@@ -6207,8 +6228,8 @@
       }, 350);
     });
 
-    // Rejestracja Service Workera (z pełnym precache aplikacji + wszystkich 57 próbek studyjnych)
-    if ('serviceWorker' in navigator) {
+    // Rejestracja Service Workera (dla wersji przeglądarkowej/PWA; natywne APK ma wszystkie pliki wbudowane)
+    if (!isNativeAndroidApk && 'serviceWorker' in navigator) {
       window.addEventListener('load', () => {
         navigator.serviceWorker.register('./sw.js')
           .then((reg) => {
