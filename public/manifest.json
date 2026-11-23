@@ -1,0 +1,42 @@
+{
+  "id": "./",
+  "name": "Jazz Fretboard Lab",
+  "short_name": "JazzFretLab",
+  "description": "Laboratorium improwizacji jazzowej i substytucji pentatonicznych na gryfie gitary z generatorem fraz, tabulaturą i odtwarzaczem audio.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "dir": "ltr",
+  "prefer_related_applications": false,
+  "theme_color": "#0f172a",
+  "background_color": "#020617",
+  "categories": ["music", "education", "utilities"],
+  "lang": "pl",
+  "icons": [
+    {
+      "src": "./pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

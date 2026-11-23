@@ -1,0 +1,6 @@
+{
+  "name": "Jazz Fretboard Lab",
+  "description": "Mobilne laboratorium improwizacji jazzowej i substytucji pentatonicznych na gryfie gitary.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
