@@ -625,7 +625,7 @@
             </button>
             <button id="toggleHihatBtnTop" class="px-2 py-1 rounded-lg border border-cyan-500/40 bg-cyan-500/15 text-cyan-300 font-bold text-[11px] flex items-center gap-1 transition active:scale-95" title="Włącz lub wyłącz puls hi-hatu na 2 i 4">
               <span>🥁</span>
-              <span id="hihatStatusTextTop">Hi-Hat: WŁ</span>
+              <span id="hihatStatusTextTop">Ride/Hat: WŁ</span>
             </button>
           </div>
         </div>
@@ -840,7 +840,7 @@
             </button>
             <button id="toggleHihatBtn" class="px-2 py-1 rounded-lg border border-cyan-500/40 bg-cyan-500/15 text-cyan-300 font-bold text-[11px] flex items-center gap-1 transition active:scale-95" title="Włącz lub wyłącz puls hi-hatu na 2 i 4">
               <span>🥁</span>
-              <span id="hihatStatusText">Hi-Hat: WŁ</span>
+              <span id="hihatStatusText">Ride/Hat: WŁ</span>
             </button>
           </div>
         </div>
@@ -2055,26 +2055,234 @@
         rootPitch,
         bassName: NOTE_NAMES[bassPitch],
         bassMidi,
+        thirdInterval: third,
+        fifthInterval: fifth,
+        seventhInterval: seventh,
+        uniquePitches,
         chordMidis,
         notes: chordMidis.map(m => NOTE_NAMES[m % 12])
       };
     }
 
+    // Płynne prowadzenie głosów (Smooth Voice Leading) pomiędzy kolejnymi akordami compingu
+    function getVoiceLedChordVoicing(chordStr, prevMidis = null) {
+      const base = getChordVoicing(chordStr);
+      if (!prevMidis || prevMidis.length === 0 || !base.uniquePitches || base.uniquePitches.length === 0) {
+        return base;
+      }
+
+      const prevCenter = Math.max(54, Math.min(64, prevMidis.reduce((s, m) => s + m, 0) / prevMidis.length));
+      const remainingPrev = [...prevMidis];
+      const ledMidis = [];
+
+      base.uniquePitches.forEach((pc) => {
+        const candidates = [];
+        for (let oct = 48; oct <= 72; oct += 12) {
+          const m = oct + pc;
+          if (m >= 48 && m <= 70) candidates.push(m);
+        }
+        if (candidates.length === 0) candidates.push(50 + pc);
+
+        let bestMidi = candidates[0];
+        let bestScore = Infinity;
+        let matchedPrevIdx = -1;
+
+        candidates.forEach((cand) => {
+          if (ledMidis.includes(cand)) return;
+          let dist = Math.abs(cand - prevCenter);
+          let localIdx = -1;
+          if (remainingPrev.length > 0) {
+            let minPrevDist = Infinity;
+            remainingPrev.forEach((pm, pIdx) => {
+              const d = Math.abs(cand - pm);
+              if (d < minPrevDist) {
+                minPrevDist = d;
+                localIdx = pIdx;
+              }
+            });
+            dist = minPrevDist * 1.15 + Math.abs(cand - prevCenter) * 0.25;
+          }
+          // Delikatna kara za zderzenie półtonowe w niskim rejestrze
+          const hasLowClash = ledMidis.some(m => Math.abs(m - cand) === 1 && Math.min(m, cand) < 56);
+          if (hasLowClash) dist += 6;
+
+          if (dist < bestScore) {
+            bestScore = dist;
+            bestMidi = cand;
+            matchedPrevIdx = localIdx;
+          }
+        });
+
+        if (matchedPrevIdx !== -1) {
+          remainingPrev.splice(matchedPrevIdx, 1);
+        }
+        ledMidis.push(bestMidi);
+      });
+
+      ledMidis.sort((a, b) => a - b);
+      // Zabezpieczenie przed zbyt rozległym rozrzutem głosów (> 15 półtonów)
+      if (ledMidis.length >= 2 && (ledMidis[ledMidis.length - 1] - ledMidis[0]) > 15) {
+        if (ledMidis[0] + 12 <= 70 && !ledMidis.includes(ledMidis[0] + 12)) {
+          ledMidis[0] += 12;
+          ledMidis.sort((a, b) => a - b);
+        }
+      }
+
+      return {
+        ...base,
+        chordMidis: ledMidis,
+        notes: ledMidis.map(m => NOTE_NAMES[m % 12])
+      };
+    }
+
+    // --- 6. STUDYJNY SILNIK AUDIO (MULTI-SAMPLE + STEREO SOUNDSTAGE + ROOM REVERB + MASTER COMPRESSOR) ---
     let audioCtx = null;
+    let masterBusNodes = null;
+    let roomReverbNodes = null;
     let soloBusGain = null;
     let accompBusGain = null;
+    let bassBusInput = null;
+    let compBusInput = null;
+    let drumsBusInput = null;
     let activeAudioNodes = [];
     let noiseBuffer = null;
+
+    function createSafePanner(ctx, panValue) {
+      if (typeof ctx.createStereoPanner === 'function') {
+        const p = ctx.createStereoPanner();
+        p.pan.setValueAtTime(panValue, ctx.currentTime);
+        return p;
+      }
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(1.0, ctx.currentTime);
+      return g;
+    }
 
     function getAudioContext() {
       if (!audioCtx) {
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
         audioCtx = new AudioContextClass();
+        // Natychmiastowe zdekodowanie pobranych próbek studyjnych po utworzeniu kontekstu
+        setTimeout(() => {
+          preloadStudioSamplesForCurrentSetup(true);
+        }, 0);
       }
       if (audioCtx.state === 'suspended') {
         audioCtx.resume();
       }
       return audioCtx;
+    }
+
+    // Master Bus z kompresorem studyjnym (glue + ochrona przed przesterowaniem)
+    function getMasterBus() {
+      const ctx = getAudioContext();
+      if (!masterBusNodes) {
+        const input = ctx.createGain();
+        input.gain.setValueAtTime(1.0, ctx.currentTime);
+
+        let outputStage = input;
+        if (typeof ctx.createDynamicsCompressor === 'function') {
+          const compressor = ctx.createDynamicsCompressor();
+          compressor.threshold.setValueAtTime(-14, ctx.currentTime);
+          compressor.knee.setValueAtTime(16, ctx.currentTime);
+          compressor.ratio.setValueAtTime(3.2, ctx.currentTime);
+          compressor.attack.setValueAtTime(0.008, ctx.currentTime);
+          compressor.release.setValueAtTime(0.18, ctx.currentTime);
+
+          const makeup = ctx.createGain();
+          makeup.gain.setValueAtTime(1.08, ctx.currentTime);
+
+          input.connect(compressor);
+          compressor.connect(makeup);
+          makeup.connect(ctx.destination);
+          outputStage = makeup;
+        } else {
+          input.connect(ctx.destination);
+        }
+
+        masterBusNodes = { input, outputStage };
+      }
+      return masterBusNodes;
+    }
+
+    // Realistyczna stereo odpowiedź impulsowa ciepłego klubu jazzowego (Jazz Club Room Reverb IR ~1.15s)
+    function buildJazzClubReverbIR(ctx) {
+      const sr = ctx.sampleRate;
+      const duration = 1.15;
+      const len = Math.floor(sr * duration);
+      const buffer = ctx.createBuffer(2, len, sr);
+      const left = buffer.getChannelData(0);
+      const right = buffer.getChannelData(1);
+
+      const preDelaySamples = Math.floor(sr * 0.014);
+      // Asymetryczne wczesne odbicia drewnianych ścian klubu (Early Reflections)
+      const earlyL = [
+        { t: 0.016, g: 0.48 }, { t: 0.024, g: 0.36 }, { t: 0.035, g: 0.28 },
+        { t: 0.047, g: 0.22 }, { t: 0.062, g: 0.16 }
+      ];
+      const earlyR = [
+        { t: 0.019, g: 0.45 }, { t: 0.029, g: 0.34 }, { t: 0.041, g: 0.26 },
+        { t: 0.053, g: 0.20 }, { t: 0.069, g: 0.15 }
+      ];
+
+      earlyL.forEach(er => {
+        const idx = Math.floor(er.t * sr);
+        if (idx < len) left[idx] += er.g;
+      });
+      earlyR.forEach(er => {
+        const idx = Math.floor(er.t * sr);
+        if (idx < len) right[idx] += er.g;
+      });
+
+      // Rozproszony ogon pogłosu z tłumieniem wysokich częstotliwości (ciepły pokój)
+      let lpL = 0;
+      let lpR = 0;
+      for (let i = preDelaySamples; i < len; i++) {
+        const t = (i - preDelaySamples) / sr;
+        const env = Math.exp(-t * 3.85) * (1 - Math.exp(-t * 45));
+        const damp = Math.max(0.18, 0.55 * Math.exp(-t * 1.4));
+        const nL = Math.random() * 2 - 1;
+        const nR = Math.random() * 2 - 1;
+        lpL = lpL + damp * (nL - lpL);
+        lpR = lpR + damp * (nR - lpR);
+        left[i] += lpL * env * 0.34;
+        right[i] += lpR * env * 0.34;
+      }
+
+      return buffer;
+    }
+
+    function getRoomReverb() {
+      const ctx = getAudioContext();
+      if (!roomReverbNodes) {
+        const input = ctx.createGain();
+        input.gain.setValueAtTime(1.0, ctx.currentTime);
+
+        const hp = ctx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.setValueAtTime(185, ctx.currentTime);
+        hp.Q.setValueAtTime(0.7, ctx.currentTime);
+
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.setValueAtTime(3600, ctx.currentTime);
+        lp.Q.setValueAtTime(0.7, ctx.currentTime);
+
+        const convolver = ctx.createConvolver();
+        convolver.buffer = buildJazzClubReverbIR(ctx);
+
+        const returnGain = ctx.createGain();
+        returnGain.gain.setValueAtTime(0.26, ctx.currentTime);
+
+        input.connect(hp);
+        hp.connect(lp);
+        lp.connect(convolver);
+        convolver.connect(returnGain);
+        returnGain.connect(getMasterBus().input);
+
+        roomReverbNodes = { input, convolver, returnGain };
+      }
+      return roomReverbNodes;
     }
 
     function getSoloBus() {
@@ -2083,7 +2291,16 @@
         soloBusGain = ctx.createGain();
         const vol = (typeof state.soloVolume === 'number') ? state.soloVolume : 0.85;
         soloBusGain.gain.setValueAtTime(vol, ctx.currentTime);
-        soloBusGain.connect(ctx.destination);
+
+        // Gitara solowa lekko na lewo od centrum (-0.14) w panoramie sceny jazzowej
+        const soloPan = createSafePanner(ctx, -0.14);
+        const reverbSend = ctx.createGain();
+        reverbSend.gain.setValueAtTime(0.22, ctx.currentTime);
+
+        soloBusGain.connect(soloPan);
+        soloPan.connect(getMasterBus().input);
+        soloPan.connect(reverbSend);
+        reverbSend.connect(getRoomReverb().input);
       }
       return soloBusGain;
     }
@@ -2095,12 +2312,273 @@
         const baseVol = (typeof state.accompVolume === 'number') ? state.accompVolume : 0.70;
         const vol = state.accompEnabled ? baseVol : 0.0001;
         accompBusGain.gain.setValueAtTime(vol, ctx.currentTime);
-        accompBusGain.connect(ctx.destination);
+        accompBusGain.connect(getMasterBus().input);
       }
       return accompBusGain;
     }
 
-    // --- SILNIK BRZMIENIA GITARZYSTÓW OPARTY NA PRÓBKACH (SAMPLED EXCITATIONS & ACOUSTIC BODY CONVOLUTION) ---
+    function getBassBus() {
+      const ctx = getAudioContext();
+      if (!bassBusInput) {
+        bassBusInput = ctx.createGain();
+        bassBusInput.gain.setValueAtTime(1.0, ctx.currentTime);
+
+        const woodRes = ctx.createBiquadFilter();
+        woodRes.type = 'peaking';
+        woodRes.frequency.setValueAtTime(112, ctx.currentTime);
+        woodRes.Q.setValueAtTime(1.3, ctx.currentTime);
+        woodRes.gain.setValueAtTime(2.6, ctx.currentTime);
+
+        const warmthLp = ctx.createBiquadFilter();
+        warmthLp.type = 'lowpass';
+        warmthLp.frequency.setValueAtTime(1750, ctx.currentTime);
+        warmthLp.Q.setValueAtTime(0.7, ctx.currentTime);
+
+        // Kontrabas stabilnie w samym centrum (0.0) + minimalny oddech sali
+        const bassPan = createSafePanner(ctx, 0.0);
+        const reverbSend = ctx.createGain();
+        reverbSend.gain.setValueAtTime(0.05, ctx.currentTime);
+
+        bassBusInput.connect(woodRes);
+        woodRes.connect(warmthLp);
+        warmthLp.connect(bassPan);
+        bassPan.connect(getAccompanimentBus());
+        bassPan.connect(reverbSend);
+        reverbSend.connect(getRoomReverb().input);
+      }
+      return bassBusInput;
+    }
+
+    function getCompBus() {
+      const ctx = getAudioContext();
+      if (!compBusInput) {
+        compBusInput = ctx.createGain();
+        compBusInput.gain.setValueAtTime(1.0, ctx.currentTime);
+
+        // Organy / Rhodes / Gitara rytmiczna delikatnie po prawej (+0.18)
+        const compPan = createSafePanner(ctx, 0.18);
+        const reverbSend = ctx.createGain();
+        reverbSend.gain.setValueAtTime(0.24, ctx.currentTime);
+
+        compBusInput.connect(compPan);
+        compPan.connect(getAccompanimentBus());
+        compPan.connect(reverbSend);
+        reverbSend.connect(getRoomReverb().input);
+      }
+      return compBusInput;
+    }
+
+    function getDrumsBus() {
+      const ctx = getAudioContext();
+      if (!drumsBusInput) {
+        drumsBusInput = ctx.createGain();
+        drumsBusInput.gain.setValueAtTime(1.0, ctx.currentTime);
+
+        // Talerz Ride / Hi-Hat / Rimshot po prawej stronie sceny (+0.26)
+        const drumsPan = createSafePanner(ctx, 0.26);
+        const reverbSend = ctx.createGain();
+        reverbSend.gain.setValueAtTime(0.20, ctx.currentTime);
+
+        drumsBusInput.connect(drumsPan);
+        drumsPan.connect(getAccompanimentBus());
+        drumsPan.connect(reverbSend);
+        reverbSend.connect(getRoomReverb().input);
+      }
+      return drumsBusInput;
+    }
+
+    // --- BIBLIOTEKA PRAWDZIWYCH PRÓBEK STUDYJNYCH (MUSYNGKITE SOUNDFONT MULTI-SAMPLES) ---
+    const SOUNDFONT_CDN_BASE = 'https://gleitz.github.io/midi-js-soundfonts/MusyngKite/';
+    const SOUNDFONT_NOTE_NAMES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
+
+    function midiToSoundfontName(midi) {
+      const octave = Math.floor(midi / 12) - 1;
+      return SOUNDFONT_NOTE_NAMES[midi % 12] + octave;
+    }
+
+    const STUDIO_SAMPLE_CONFIG = {
+      jazz_guitar: {
+        folder: 'electric_guitar_jazz-mp3',
+        midis: [45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81]
+      },
+      clean_guitar: {
+        folder: 'electric_guitar_clean-mp3',
+        midis: [45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81]
+      },
+      acoustic_bass: {
+        folder: 'acoustic_bass-mp3',
+        midis: [36, 39, 42, 45, 48, 51, 54]
+      },
+      hammond_organ: {
+        folder: 'drawbar_organ-mp3',
+        midis: [48, 51, 54, 57, 60, 63, 66, 69]
+      },
+      rhodes_piano: {
+        folder: 'electric_piano_1-mp3',
+        midis: [48, 51, 54, 57, 60, 63, 66, 69]
+      },
+      freddie_guitar: {
+        folder: 'acoustic_guitar_steel-mp3',
+        midis: [48, 51, 54, 57, 60, 63, 66, 69]
+      }
+    };
+
+    const studioSampleEngine = {
+      rawBytes: {},
+      decoded: {},
+      inFlightFetch: {},
+      inFlightDecode: {}
+    };
+
+    function fetchInstrumentSampleBytes(instKey, midi) {
+      const cfg = STUDIO_SAMPLE_CONFIG[instKey];
+      if (!cfg || typeof fetch !== 'function') return Promise.resolve(null);
+      if (!studioSampleEngine.rawBytes[instKey]) studioSampleEngine.rawBytes[instKey] = {};
+      if (!studioSampleEngine.inFlightFetch[instKey]) studioSampleEngine.inFlightFetch[instKey] = {};
+
+      if (studioSampleEngine.rawBytes[instKey][midi]) {
+        return Promise.resolve(studioSampleEngine.rawBytes[instKey][midi]);
+      }
+      if (studioSampleEngine.inFlightFetch[instKey][midi]) {
+        return studioSampleEngine.inFlightFetch[instKey][midi];
+      }
+
+      const noteName = midiToSoundfontName(midi);
+      const url = `${SOUNDFONT_CDN_BASE}${cfg.folder}/${noteName}.mp3`;
+      const p = fetch(url, { mode: 'cors' })
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.arrayBuffer();
+        })
+        .then((buf) => {
+          studioSampleEngine.rawBytes[instKey][midi] = buf;
+          delete studioSampleEngine.inFlightFetch[instKey][midi];
+          return buf;
+        })
+        .catch(() => {
+          delete studioSampleEngine.inFlightFetch[instKey][midi];
+          return null;
+        });
+
+      studioSampleEngine.inFlightFetch[instKey][midi] = p;
+      return p;
+    }
+
+    function decodeInstrumentSample(instKey, midi) {
+      if (!audioCtx || typeof audioCtx.decodeAudioData !== 'function') return Promise.resolve(null);
+      if (!studioSampleEngine.decoded[instKey]) studioSampleEngine.decoded[instKey] = {};
+      if (!studioSampleEngine.inFlightDecode[instKey]) studioSampleEngine.inFlightDecode[instKey] = {};
+
+      if (studioSampleEngine.decoded[instKey][midi]) {
+        return Promise.resolve(studioSampleEngine.decoded[instKey][midi]);
+      }
+      if (studioSampleEngine.inFlightDecode[instKey][midi]) {
+        return studioSampleEngine.inFlightDecode[instKey][midi];
+      }
+
+      const p = fetchInstrumentSampleBytes(instKey, midi)
+        .then((raw) => {
+          if (!raw || !audioCtx) return null;
+          // Kopia bufora chroni przed odłączeniem ArrayBuffer przez decodeAudioData
+          const copy = raw.slice(0);
+          return audioCtx.decodeAudioData(copy);
+        })
+        .then((audioBuf) => {
+          if (audioBuf) {
+            studioSampleEngine.decoded[instKey][midi] = audioBuf;
+          }
+          delete studioSampleEngine.inFlightDecode[instKey][midi];
+          return audioBuf;
+        })
+        .catch(() => {
+          delete studioSampleEngine.inFlightDecode[instKey][midi];
+          return null;
+        });
+
+      studioSampleEngine.inFlightDecode[instKey][midi] = p;
+      return p;
+    }
+
+    function preloadStudioInstrument(instKey, shouldDecode = false) {
+      const cfg = STUDIO_SAMPLE_CONFIG[instKey];
+      if (!cfg) return Promise.resolve();
+      return Promise.all(cfg.midis.map((midi) => {
+        if (shouldDecode && audioCtx) {
+          return decodeInstrumentSample(instKey, midi);
+        }
+        return fetchInstrumentSampleBytes(instKey, midi);
+      }));
+    }
+
+    function preloadStudioSamplesForCurrentSetup(shouldDecode = false) {
+      const guitarKey = state.guitarTone === 'scofield' ? 'clean_guitar' : 'jazz_guitar';
+      const accompKey = (state.accompStyle === 'hammond' || state.accompStyle === 'sustain')
+        ? 'hammond_organ'
+        : (state.accompStyle === 'freddie' ? 'freddie_guitar' : 'rhodes_piano');
+
+      return Promise.all([
+        preloadStudioInstrument(guitarKey, shouldDecode),
+        preloadStudioInstrument('acoustic_bass', shouldDecode),
+        preloadStudioInstrument(accompKey, shouldDecode)
+      ]);
+    }
+
+    // Pobiera w tle WSZYSTKIE 6 zestawów próbek studyjnych (łącznie ~0,9 MB),
+    // aby po pierwszym uruchomieniu wszystkie brzmienia i style działały 100% offline
+    let fullStudioPreloadStarted = false;
+    function preloadAllStudioSamples(shouldDecode = false) {
+      if (fullStudioPreloadStarted && !shouldDecode) return;
+      fullStudioPreloadStarted = true;
+
+      const allKeys = Object.keys(STUDIO_SAMPLE_CONFIG);
+      const priorityGuitar = state.guitarTone === 'scofield' ? 'clean_guitar' : 'jazz_guitar';
+      const priorityAccomp = (state.accompStyle === 'hammond' || state.accompStyle === 'sustain')
+        ? 'hammond_organ'
+        : (state.accompStyle === 'freddie' ? 'freddie_guitar' : 'rhodes_piano');
+      const priorityKeys = [priorityGuitar, 'acoustic_bass', priorityAccomp];
+      const remainingKeys = allKeys.filter((k) => !priorityKeys.includes(k));
+
+      preloadStudioSamplesForCurrentSetup(shouldDecode).then(async () => {
+        for (let i = 0; i < remainingKeys.length; i++) {
+          await preloadStudioInstrument(remainingKeys[i], shouldDecode);
+        }
+      });
+    }
+
+    function getClosestStudioSample(instKey, targetMidi) {
+      const decodedMap = studioSampleEngine.decoded[instKey];
+      if (!decodedMap) {
+        if (audioCtx) preloadStudioInstrument(instKey, true);
+        return null;
+      }
+
+      let bestMidi = null;
+      let bestDist = Infinity;
+      const keys = Object.keys(decodedMap);
+      for (let i = 0; i < keys.length; i++) {
+        const m = parseInt(keys[i], 10);
+        const buf = decodedMap[m];
+        if (!buf) continue;
+        const d = Math.abs(targetMidi - m);
+        if (d < bestDist) {
+          bestDist = d;
+          bestMidi = m;
+        }
+      }
+
+      if (bestMidi === null || bestDist > 6) {
+        if (audioCtx) preloadStudioInstrument(instKey, true);
+        return null;
+      }
+
+      return {
+        buffer: decodedMap[bestMidi],
+        playbackRate: Math.pow(2, (targetMidi - bestMidi) / 12),
+        sampleMidi: bestMidi
+      };
+    }
+
+    // --- SILNIK BRZMIENIA GITARZYSTÓW (TUBE AMP + BODY CONVOLUTION + TAPE DELAY) ---
     let guitarAmpChain = null;
     let softClipCurve = null;
     const guitarBodyImpulses = {};
@@ -2112,24 +2590,22 @@
         softClipCurve = new Float32Array(samples);
         for (let i = 0; i < samples; i++) {
           const x = (i / (samples - 1)) * 2 - 1;
-          // Subtelne, śpiewne nasycenie lampowe (soft-clipping tube overdrive) w stylu Mike'a Sterna / Leslie 122
-          softClipCurve[i] = Math.tanh(1.85 * x) / Math.tanh(1.85);
+          softClipCurve[i] = Math.tanh(1.65 * x) / Math.tanh(1.65);
         }
       }
       return softClipCurve;
     }
 
-    // Generator próbki akustycznego impulsu korpusu gitary (Acoustic Body Impulse Response dla ConvolverNode)
     function getGuitarBodyImpulseBuffer(ctx, tone) {
       if (guitarBodyImpulses[tone]) return guitarBodyImpulses[tone];
       const sr = ctx.sampleRate;
       let dur = 0.12;
-      if (tone === 'archtop') dur = 0.16; // Wes Montgomery Gibson L-5: głęboka komora rezonansowa archtopu
-      else if (tone === 'stern') dur = 0.08; // Mike Stern: otwarta kolumna 2x12 i studio room
-      else if (tone === 'scofield') dur = 0.10; // John Scofield: semi-hollow klonowy blok centralny
+      if (tone === 'archtop') dur = 0.16;
+      else if (tone === 'stern') dur = 0.08;
+      else if (tone === 'scofield') dur = 0.10;
 
       const len = Math.floor(sr * dur);
-      const buffer = ctx.createBuffer(2, len, sr); // Stereo dla naturalnej głębi przestrzennej
+      const buffer = ctx.createBuffer(2, len, sr);
       const left = buffer.getChannelData(0);
       const right = buffer.getChannelData(1);
 
@@ -2139,7 +2615,6 @@
         let rVal = 0;
 
         if (tone === 'archtop') {
-          // Gibson L-5 CES: rezonans pudła z rzeźbioną płytą świerkową (Helmholtz 108Hz, płyta wierzchnia 225Hz, tył 435Hz)
           const decay = Math.exp(-22 * t);
           const woodTap = (Math.random() * 2 - 1) * Math.exp(-70 * t) * 0.22;
           const helmholtz = Math.sin(2 * Math.PI * 108 * t) * 0.58;
@@ -2149,7 +2624,6 @@
           const backPlateR = Math.sin(2 * Math.PI * 438 * t + 0.8) * 0.24;
           rVal = (helmholtz + topPlate + backPlateR - woodTap * 0.8) * decay;
         } else if (tone === 'scofield') {
-          // Ibanez AS-200: semi-hollow z litym blokiem klonowym (rezonans 320Hz, wokalny środek 1480Hz)
           const decay = Math.exp(-30 * t);
           const block = Math.sin(2 * Math.PI * 320 * t) * 0.45;
           const vocalMid = Math.sin(2 * Math.PI * 1480 * t) * 0.38;
@@ -2157,7 +2631,6 @@
           lVal = (block + vocalMid + grit) * decay;
           rVal = (block + Math.sin(2 * Math.PI * 1485 * t + 0.5) * 0.38 - grit * 0.7) * decay;
         } else {
-          // Mike Stern: Solidbody Telecaster + Twin Reverb 2x12 Cabinet + Early Studio Reflections
           const decay = Math.exp(-36 * t);
           const cabLow = Math.sin(2 * Math.PI * 135 * t) * 0.35;
           const cabMid = Math.sin(2 * Math.PI * 850 * t) * 0.45;
@@ -2175,11 +2648,10 @@
       return buffer;
     }
 
-    // Generator próbki ataku struny (Sampled Pluck / Transient Excitation Buffer)
     function getGuitarExcitationSample(ctx, tone) {
       if (guitarExcitationSamples[tone]) return guitarExcitationSamples[tone];
       const sr = ctx.sampleRate;
-      const dur = 0.022; // 22ms próbka ataku
+      const dur = 0.022;
       const len = Math.floor(sr * dur);
       const buffer = ctx.createBuffer(1, len, sr);
       const data = buffer.getChannelData(0);
@@ -2187,18 +2659,15 @@
       for (let i = 0; i < len; i++) {
         const t = i / len;
         if (tone === 'archtop') {
-          // Wes Montgomery: uderzenie kciukiem (miękkie, głęboki impuls mięsisty bez ostrej kostki)
           const env = Math.sin(t * Math.PI) * Math.exp(-t * 3.8);
           const thumbThump = Math.sin(2 * Math.PI * 180 * (i / sr));
           data[i] = thumbThump * env * 0.75;
         } else if (tone === 'scofield') {
-          // John Scofield: kątowe uderzenie twardą kostką z chrupnięciem struny (snappy pick attack)
           const env = Math.exp(-t * 11);
           const pickChirp = Math.sin(2 * Math.PI * (2800 - 1700 * t) * (i / sr));
           const noise = (Math.random() * 2 - 1) * Math.exp(-t * 16);
           data[i] = (pickChirp * 0.55 + noise * 0.45) * env * 0.82;
         } else {
-          // Mike Stern: precyzyjne uderzenie kostką na niklowej strunie (snappy plectrum snap)
           const env = Math.exp(-t * 13);
           const pickSnap = Math.sin(2 * Math.PI * (3400 - 1900 * t) * (i / sr));
           const stringChirp = Math.sin(2 * Math.PI * 980 * (i / sr)) * 0.42;
@@ -2217,53 +2686,46 @@
         const input = ctx.createGain();
         input.gain.setValueAtTime(1.0, ctx.currentTime);
 
-        // 1. Filtr dolnozaporowy (usuwa dudniący sub-bas poniżej 95Hz)
         const lowCut = ctx.createBiquadFilter();
         lowCut.type = 'highpass';
         lowCut.frequency.setValueAtTime(95, ctx.currentTime);
         lowCut.Q.setValueAtTime(0.7, ctx.currentTime);
 
-        // 2. Ciepłe nasycenie lampowe (Mike Stern subtle tube drive)
         const shaper = ctx.createWaveShaper();
         shaper.curve = getSoftClipCurve();
         shaper.oversample = '2x';
 
-        // 3. Charakterystyka wokalnego środka (Humbucker Vocal Mid-Peak)
         const midVoicing = ctx.createBiquadFilter();
         midVoicing.type = 'peaking';
         midVoicing.frequency.setValueAtTime(980, ctx.currentTime);
         midVoicing.Q.setValueAtTime(1.3, ctx.currentTime);
-        midVoicing.gain.setValueAtTime(3.8, ctx.currentTime);
+        midVoicing.gain.setValueAtTime(3.2, ctx.currentTime);
 
-        // 4. Prezencja i atak kostki (Presence)
         const presence = ctx.createBiquadFilter();
         presence.type = 'peaking';
         presence.frequency.setValueAtTime(2850, ctx.currentTime);
         presence.Q.setValueAtTime(1.5, ctx.currentTime);
-        presence.gain.setValueAtTime(2.2, ctx.currentTime);
+        presence.gain.setValueAtTime(1.8, ctx.currentTime);
 
-        // 5. Symulacja kolumny głośnikowej (Cabinet - odcięcie ostrych częstotliwości powyżej 4.6kHz)
         const cabFilter = ctx.createBiquadFilter();
         cabFilter.type = 'lowpass';
         cabFilter.frequency.setValueAtTime(4600, ctx.currentTime);
-        cabFilter.Q.setValueAtTime(1.1, ctx.currentTime);
+        cabFilter.Q.setValueAtTime(1.0, ctx.currentTime);
 
-        // 6. Symulacja akustycznego pudła / kolumny przez Convolver z próbką odpowiedzi impulsowej (Body Convolver)
         const bodyConvolver = ctx.createConvolver();
         bodyConvolver.buffer = getGuitarBodyImpulseBuffer(ctx, state.guitarTone);
 
         const bodyWetGain = ctx.createGain();
-        bodyWetGain.gain.setValueAtTime(0.42, ctx.currentTime);
+        bodyWetGain.gain.setValueAtTime(0.28, ctx.currentTime);
 
         const bodyDryGain = ctx.createGain();
-        bodyDryGain.gain.setValueAtTime(0.78, ctx.currentTime);
+        bodyDryGain.gain.setValueAtTime(0.84, ctx.currentTime);
 
-        // 7. Analogowy Delay przestrzenny (Mike Stern 230ms Warm Tape Delay)
         const delaySend = ctx.createGain();
         delaySend.gain.setValueAtTime(state.sternDelayEnabled ? 0.24 : 0.0001, ctx.currentTime);
 
         const delayNode = ctx.createDelay(1.0);
-        delayNode.delayTime.setValueAtTime(0.23, ctx.currentTime); // 230ms
+        delayNode.delayTime.setValueAtTime(0.23, ctx.currentTime);
 
         const delayFeedback = ctx.createGain();
         delayFeedback.gain.setValueAtTime(0.22, ctx.currentTime);
@@ -2277,10 +2739,10 @@
         delayFeedback.connect(delayNode);
 
         const dryGain = ctx.createGain();
-        dryGain.gain.setValueAtTime(0.88, ctx.currentTime);
+        dryGain.gain.setValueAtTime(0.90, ctx.currentTime);
 
         const delayReturn = ctx.createGain();
-        delayReturn.gain.setValueAtTime(state.sternDelayEnabled ? 0.38 : 0.0001, ctx.currentTime);
+        delayReturn.gain.setValueAtTime(state.sternDelayEnabled ? 0.36 : 0.0001, ctx.currentTime);
 
         input.connect(lowCut);
         lowCut.connect(shaper);
@@ -2327,83 +2789,172 @@
       const isArchtop = state.guitarTone === 'archtop';
       const isScofield = state.guitarTone === 'scofield';
 
-      // Odświeżenie próbki odpowiedzi impulsowej korpusu gitary
       if (guitarAmpChain.bodyConvolver) {
         guitarAmpChain.bodyConvolver.buffer = getGuitarBodyImpulseBuffer(audioCtx, state.guitarTone);
       }
 
       if (isStern) {
         guitarAmpChain.midVoicing.frequency.setValueAtTime(980, t);
-        guitarAmpChain.midVoicing.gain.setValueAtTime(3.8, t);
-        guitarAmpChain.presence.gain.setValueAtTime(2.2, t);
+        guitarAmpChain.midVoicing.gain.setValueAtTime(3.2, t);
+        guitarAmpChain.presence.gain.setValueAtTime(1.8, t);
         guitarAmpChain.cabFilter.frequency.setValueAtTime(4600, t);
-        guitarAmpChain.bodyWetGain.gain.setValueAtTime(0.38, t);
-        guitarAmpChain.bodyDryGain.gain.setValueAtTime(0.78, t);
+        guitarAmpChain.bodyWetGain.gain.setValueAtTime(0.24, t);
+        guitarAmpChain.bodyDryGain.gain.setValueAtTime(0.84, t);
         guitarAmpChain.delaySend.gain.setValueAtTime(state.sternDelayEnabled ? 0.24 : 0.0001, t);
-        guitarAmpChain.delayReturn.gain.setValueAtTime(state.sternDelayEnabled ? 0.38 : 0.0001, t);
+        guitarAmpChain.delayReturn.gain.setValueAtTime(state.sternDelayEnabled ? 0.36 : 0.0001, t);
       } else if (isArchtop) {
-        // Wes Montgomery: ciemny, mięsisty archtop, głęboki rezonans drewniany, bez jaskrawej góry
-        guitarAmpChain.midVoicing.frequency.setValueAtTime(450, t);
-        guitarAmpChain.midVoicing.gain.setValueAtTime(2.2, t);
-        guitarAmpChain.presence.gain.setValueAtTime(-1.8, t);
-        guitarAmpChain.cabFilter.frequency.setValueAtTime(2400, t);
-        guitarAmpChain.bodyWetGain.gain.setValueAtTime(0.56, t); // Mocna odpowiedź pudła świerkowego
-        guitarAmpChain.bodyDryGain.gain.setValueAtTime(0.65, t);
+        guitarAmpChain.midVoicing.frequency.setValueAtTime(440, t);
+        guitarAmpChain.midVoicing.gain.setValueAtTime(2.4, t);
+        guitarAmpChain.presence.gain.setValueAtTime(-2.2, t);
+        guitarAmpChain.cabFilter.frequency.setValueAtTime(2250, t);
+        guitarAmpChain.bodyWetGain.gain.setValueAtTime(0.38, t);
+        guitarAmpChain.bodyDryGain.gain.setValueAtTime(0.76, t);
         guitarAmpChain.delaySend.gain.setValueAtTime(0.0001, t);
         guitarAmpChain.delayReturn.gain.setValueAtTime(0.0001, t);
       } else if (isScofield) {
-        // John Scofield: bardziej chropowaty, otwarty, funkujący sound z wyrazistym środkiem
         guitarAmpChain.midVoicing.frequency.setValueAtTime(1450, t);
-        guitarAmpChain.midVoicing.gain.setValueAtTime(4.2, t);
-        guitarAmpChain.presence.gain.setValueAtTime(3.0, t);
+        guitarAmpChain.midVoicing.gain.setValueAtTime(3.8, t);
+        guitarAmpChain.presence.gain.setValueAtTime(2.6, t);
         guitarAmpChain.cabFilter.frequency.setValueAtTime(4100, t);
-        guitarAmpChain.bodyWetGain.gain.setValueAtTime(0.44, t);
-        guitarAmpChain.bodyDryGain.gain.setValueAtTime(0.72, t);
+        guitarAmpChain.bodyWetGain.gain.setValueAtTime(0.28, t);
+        guitarAmpChain.bodyDryGain.gain.setValueAtTime(0.80, t);
         guitarAmpChain.delaySend.gain.setValueAtTime(state.sternDelayEnabled ? 0.18 : 0.0001, t);
         guitarAmpChain.delayReturn.gain.setValueAtTime(state.sternDelayEnabled ? 0.28 : 0.0001, t);
       }
     }
 
-    function playJazzGuitarNote(midiPitch, startTime = 0, duration = 0.6) {
+    function trackAudioNode(n) {
+      activeAudioNodes.push(n);
+      n.onended = () => {
+        try { n.disconnect(); } catch (e) {}
+        const idx = activeAudioNodes.indexOf(n);
+        if (idx !== -1) activeAudioNodes.splice(idx, 1);
+      };
+    }
+
+    function playJazzGuitarNote(midiPitch, startTime = 0, duration = 0.6, opts = {}) {
       try {
         const ctx = getAudioContext();
         const time = Math.max(ctx.currentTime, startTime || ctx.currentTime);
-        const freq = 440 * Math.pow(2, (midiPitch - 69) / 12);
         const ampChain = getGuitarAmpChain();
         const isStern = state.guitarTone === 'stern';
         const isArchtop = state.guitarTone === 'archtop';
         const isScofield = state.guitarTone === 'scofield';
         const useChorus = isStern ? state.sternChorusEnabled : (isScofield ? true : false);
 
-        const safeDuration = Math.max(0.04, duration);
-        const attack = Math.min(isArchtop ? 0.016 : 0.007, safeDuration * 0.12);
+        const velocity = Math.max(0.35, Math.min(1.15, typeof opts.velocity === 'number' ? opts.velocity : 0.88));
+        const isLegato = Boolean(opts.isLegato);
+        const isPhraseEnd = Boolean(opts.isPhraseEnd);
+        const isPassing = Boolean(opts.isPassing);
+        const safeDuration = Math.max(0.05, duration);
+
+        const sampleKey = isScofield ? 'clean_guitar' : 'jazz_guitar';
+        const studioSample = getClosestStudioSample(sampleKey, midiPitch);
+
+        // === ŚCIEŻKA 1: PRAWDZIWA PRÓBKA STUDYJNA GITARY JAZZOWEJ ===
+        if (studioSample) {
+          const src = ctx.createBufferSource();
+          src.buffer = studioSample.buffer;
+          src.playbackRate.setValueAtTime(studioSample.playbackRate, time);
+
+          // Filtr dynamiczny: cichsze nuty / ghost notes są cieplejsze, akcenty otwierają pasmo
+          const dynFilter = ctx.createBiquadFilter();
+          dynFilter.type = 'lowpass';
+          const baseCutoff = isArchtop ? 2100 : (isScofield ? 4200 : 3700);
+          const velCutoff = baseCutoff * (0.62 + velocity * 0.42) * (isPassing ? 0.82 : 1.0);
+          dynFilter.frequency.setValueAtTime(Math.max(950, velCutoff), time);
+          dynFilter.Q.setValueAtTime(0.8, time);
+
+          const env = ctx.createGain();
+          const peakVol = (isArchtop ? 0.92 : 0.86) * velocity * (isLegato ? 0.88 : 1.0);
+          const attack = Math.min(isLegato ? 0.015 : (isArchtop ? 0.010 : 0.004), safeDuration * 0.18);
+          const releaseTail = Math.min(isPhraseEnd ? 0.22 : 0.11, safeDuration * 0.45);
+          const holdEnd = Math.max(time + attack + 0.008, time + safeDuration);
+          const endTime = holdEnd + releaseTail;
+
+          env.gain.setValueAtTime(0.0001, time);
+          env.gain.linearRampToValueAtTime(peakVol, time + attack);
+          env.gain.setValueAtTime(peakVol * 0.92, holdEnd);
+          env.gain.exponentialRampToValueAtTime(0.0001, endTime);
+
+          src.connect(dynFilter);
+          dynFilter.connect(env);
+          env.connect(ampChain.input);
+
+          // Subtelne jazzowe wibrato z opóźnieniem na dłuższych nutach i końcówkach fraz
+          let vibLfo = null;
+          if ((safeDuration >= 0.40 || isPhraseEnd) && src.detune) {
+            vibLfo = ctx.createOscillator();
+            vibLfo.type = 'sine';
+            vibLfo.frequency.setValueAtTime(5.1, time);
+            const vibGain = ctx.createGain();
+            const vibDelay = time + Math.min(0.16, safeDuration * 0.35);
+            const vibPeak = Math.min(endTime - 0.02, vibDelay + 0.18);
+            vibGain.gain.setValueAtTime(0.0001, time);
+            vibGain.gain.setValueAtTime(0.0001, vibDelay);
+            if (vibPeak > vibDelay + 0.01) {
+              vibGain.gain.linearRampToValueAtTime(11, vibPeak);
+            }
+            vibLfo.connect(vibGain);
+            vibGain.connect(src.detune);
+            vibLfo.start(time);
+            vibLfo.stop(endTime + 0.03);
+            trackAudioNode(vibLfo);
+          }
+
+          // Legato (hammer-on / pull-off): startujemy 22ms za atakiem kostki w próbce!
+          const sampleOffset = isLegato ? Math.min(0.022, Math.max(0, studioSample.buffer.duration - 0.15)) : 0.002;
+          src.start(time, sampleOffset);
+          src.stop(endTime + 0.04);
+          trackAudioNode(src);
+
+          // Signature Yamaha SPX90 Stereo Micro-Pitch Detune Chorus (+8c / -8c dla Sterna, ±4c Scofield)
+          if (useChorus) {
+            const detuneCents = isScofield ? 4 : 8;
+            const chorusBlend = (isScofield ? 0.17 : 0.26) * velocity;
+            [-1, 1].forEach((dir) => {
+              const cSrc = ctx.createBufferSource();
+              cSrc.buffer = studioSample.buffer;
+              const detunedRate = studioSample.playbackRate * Math.pow(2, (dir * detuneCents) / 1200);
+              cSrc.playbackRate.setValueAtTime(detunedRate, time);
+
+              const cPan = createSafePanner(ctx, dir * 0.45);
+              const cEnv = ctx.createGain();
+              cEnv.gain.setValueAtTime(0.0001, time);
+              cEnv.gain.linearRampToValueAtTime(chorusBlend, time + attack + 0.004);
+              cEnv.gain.setValueAtTime(chorusBlend * 0.90, holdEnd);
+              cEnv.gain.exponentialRampToValueAtTime(0.0001, endTime);
+
+              cSrc.connect(cEnv);
+              cEnv.connect(cPan);
+              cPan.connect(ampChain.input);
+
+              cSrc.start(time + 0.004, sampleOffset);
+              cSrc.stop(endTime + 0.04);
+              trackAudioNode(cSrc);
+            });
+          }
+          return;
+        }
+
+        // === ŚCIEŻKA 2: NATYCHMIASTOWY FALLBACK (FIZYCZNA SYNTEZA MODELOWANA) ===
+        const freq = 440 * Math.pow(2, (midiPitch - 69) / 12);
+        const attack = Math.min(isLegato ? 0.018 : (isArchtop ? 0.016 : 0.007), safeDuration * 0.14);
         const decay = Math.min(0.20, safeDuration * 0.55);
 
-        const trackNode = (n) => {
-          activeAudioNodes.push(n);
-          n.onended = () => {
-            try { n.disconnect(); } catch (e) {}
-            const idx = activeAudioNodes.indexOf(n);
-            if (idx !== -1) activeAudioNodes.splice(idx, 1);
-          };
-        };
+        if (!isLegato) {
+          const pickBuffer = getGuitarExcitationSample(ctx, state.guitarTone);
+          const pickSource = ctx.createBufferSource();
+          pickSource.buffer = pickBuffer;
+          const pickGain = ctx.createGain();
+          const pickGainVal = (isArchtop ? 0.28 : (isStern ? 0.36 : 0.40)) * velocity;
+          pickGain.gain.setValueAtTime(pickGainVal, time);
+          pickSource.connect(pickGain);
+          pickGain.connect(ampChain.input);
+          pickSource.start(time);
+          trackAudioNode(pickSource);
+        }
 
-        // --- 1. ODTWORZENIE PRÓBKI PRAWDZIWEGO ATAKU KOSTKI / KCIUKA (TACTILE SAMPLED TRANSIENT) ---
-        const pickBuffer = getGuitarExcitationSample(ctx, state.guitarTone);
-        const pickSource = ctx.createBufferSource();
-        pickSource.buffer = pickBuffer;
-
-        const pickGain = ctx.createGain();
-        const pickGainVal = isArchtop ? 0.30 : (isStern ? 0.40 : 0.44);
-        pickGain.gain.setValueAtTime(pickGainVal, time);
-        pickSource.connect(pickGain);
-        pickGain.connect(ampChain.input);
-
-        pickSource.start(time);
-        trackNode(pickSource);
-
-        // --- 2. FIZYCZNE HARMONICZNE STRUNY (INHARMONIC STRING PARTIALS Z NATURALNYM ZANIKIEM) ---
-        // Struna posiada mikroskopijną nieliniową dyspersję (inharmonicity factor B ~ 0.00018)
         const B = 0.00018;
         const f1 = freq * Math.sqrt(1 + B);
         const f2 = freq * 2 * Math.sqrt(1 + 4 * B);
@@ -2413,54 +2964,49 @@
         const osc2 = ctx.createOscillator();
         osc1.type = 'triangle';
         osc1.frequency.setValueAtTime(f1, time);
-
         osc2.type = isArchtop ? 'sine' : 'sawtooth';
         osc2.frequency.setValueAtTime(f2, time);
 
         const osc2Gain = ctx.createGain();
-        osc2Gain.gain.setValueAtTime(isArchtop ? 0.32 : 0.18, time);
+        osc2Gain.gain.setValueAtTime(isArchtop ? 0.30 : 0.17, time);
         osc2.connect(osc2Gain);
 
-        // Filtr formantu przetwornika gryfowego z naturalnym spadkiem wyższych składowych
         const pickupFilter = ctx.createBiquadFilter();
         pickupFilter.type = 'lowpass';
-        const initialCutoff = isArchtop ? Math.min(2100, freq * 2.8) : Math.min(3600, freq * 4.2);
+        const initialCutoff = (isArchtop ? Math.min(2000, freq * 2.8) : Math.min(3500, freq * 4.0)) * (0.72 + velocity * 0.32);
         pickupFilter.frequency.setValueAtTime(initialCutoff, time);
         const filterRampTime = time + Math.min(0.28, safeDuration * 0.9);
         if (filterRampTime > time + 0.01) {
           pickupFilter.frequency.exponentialRampToValueAtTime(Math.max(420, freq * 1.35), filterRampTime);
         }
-        pickupFilter.Q.setValueAtTime(isStern ? 1.5 : 1.1, time);
+        pickupFilter.Q.setValueAtTime(isStern ? 1.4 : 1.0, time);
 
         osc1.connect(pickupFilter);
         osc2Gain.connect(pickupFilter);
 
-        // Dla Mike'a Sterna i Scofielda dodaj 3. harmoniczną z szybkim naturalnym wybrzmieniem
-        let osc3 = null;
         if (!isArchtop) {
-          osc3 = ctx.createOscillator();
+          const osc3 = ctx.createOscillator();
           osc3.type = 'sine';
           osc3.frequency.setValueAtTime(f3, time);
           const osc3Gain = ctx.createGain();
-          osc3Gain.gain.setValueAtTime(0.12, time);
-          osc3Gain.gain.exponentialRampToValueAtTime(0.0001, time + Math.min(0.22, safeDuration * 0.7));
+          osc3Gain.gain.setValueAtTime(0.11 * velocity, time);
+          osc3Gain.gain.exponentialRampToValueAtTime(0.0001, time + Math.max(0.02, Math.min(0.22, safeDuration * 0.7)));
           osc3.connect(osc3Gain);
           osc3Gain.connect(pickupFilter);
           osc3.start(time);
           osc3.stop(time + safeDuration + 0.05);
-          trackNode(osc3);
+          trackAudioNode(osc3);
         }
 
-        // Obwiednia głośności nuty (envelope)
         const noteEnv = ctx.createGain();
-        const peakVol = isArchtop ? 0.48 : 0.44;
+        const peakVol = (isArchtop ? 0.48 : 0.44) * velocity * (isLegato ? 0.88 : 1.0);
         noteEnv.gain.setValueAtTime(0.0001, time);
         noteEnv.gain.linearRampToValueAtTime(peakVol, time + attack);
 
         if (safeDuration > decay + 0.03 && decay > attack + 0.01) {
-          noteEnv.gain.exponentialRampToValueAtTime(peakVol * 0.62, time + decay);
+          noteEnv.gain.exponentialRampToValueAtTime(Math.max(0.0002, peakVol * 0.62), time + decay);
         }
-        noteEnv.gain.exponentialRampToValueAtTime(0.0001, time + Math.max(attack + 0.01, safeDuration));
+        noteEnv.gain.exponentialRampToValueAtTime(0.0001, time + Math.max(attack + 0.015, safeDuration));
 
         pickupFilter.connect(noteEnv);
         noteEnv.connect(ampChain.input);
@@ -2470,27 +3016,20 @@
         osc2.start(time);
         osc1.stop(stopTime);
         osc2.stop(stopTime);
+        trackAudioNode(osc1);
+        trackAudioNode(osc2);
 
-        trackNode(osc1);
-        trackNode(osc2);
-
-        // --- 3. SIGNATURE STEREO DETUNE CHORUS MIKE'A STERNA (YAMAHA SPX90: +8 / -8 CENTS) ---
         if (useChorus) {
           const chorusDetuneCents = isScofield ? 4 : 8;
-          const freqUp = freq * Math.pow(2, chorusDetuneCents / 1200);
           const oscUp = ctx.createOscillator();
           oscUp.type = 'triangle';
-          oscUp.frequency.setValueAtTime(freqUp, time);
-
-          const freqDown = freq * Math.pow(2, -chorusDetuneCents / 1200);
+          oscUp.frequency.setValueAtTime(freq * Math.pow(2, chorusDetuneCents / 1200), time);
           const oscDown = ctx.createOscillator();
           oscDown.type = 'triangle';
-          oscDown.frequency.setValueAtTime(freqDown, time);
+          oscDown.frequency.setValueAtTime(freq * Math.pow(2, -chorusDetuneCents / 1200), time);
 
           const chorusGain = ctx.createGain();
-          const chorusBlend = isScofield ? 0.18 : 0.28;
-          chorusGain.gain.setValueAtTime(chorusBlend, time);
-
+          chorusGain.gain.setValueAtTime(isScofield ? 0.16 : 0.25, time);
           const chorusFilter = ctx.createBiquadFilter();
           chorusFilter.type = 'bandpass';
           chorusFilter.frequency.setValueAtTime(Math.min(2600, freq * 2.2), time);
@@ -2505,24 +3044,52 @@
           oscDown.start(time);
           oscUp.stop(stopTime);
           oscDown.stop(stopTime);
-
-          trackNode(oscUp);
-          trackNode(oscDown);
+          trackAudioNode(oscUp);
+          trackAudioNode(oscDown);
         }
       } catch (err) {
         console.warn('playJazzGuitarNote warning:', err);
       }
     }
 
-    // --- SYNTEZATOR KONTRABASU JAZZOWEGO (ACOUSTIC UPRIGHT BASS) ---
-    function playJazzBassNote(midiPitch, startTime, duration = 0.8) {
+    // --- KONTRABAS JAZZOWY (STUDYJNY MULTI-SAMPLE + FALLBACK SYNTEZY) ---
+    function playJazzBassNote(midiPitch, startTime, duration = 0.8, velocity = 0.88) {
       if (!state.bassEnabled || !state.accompEnabled) return;
       try {
         const ctx = getAudioContext();
         const time = Math.max(ctx.currentTime, startTime);
-        const freq = 440 * Math.pow(2, (midiPitch - 69) / 12);
         const safeDuration = Math.max(0.06, duration);
+        const vel = Math.max(0.4, Math.min(1.1, velocity));
 
+        const bassSample = getClosestStudioSample('acoustic_bass', midiPitch);
+        if (bassSample) {
+          const src = ctx.createBufferSource();
+          src.buffer = bassSample.buffer;
+          src.playbackRate.setValueAtTime(bassSample.playbackRate, time);
+
+          const env = ctx.createGain();
+          const peak = 0.86 * vel;
+          const attack = Math.min(0.007, safeDuration * 0.12);
+          const release = Math.min(0.09, safeDuration * 0.3);
+          const holdEnd = Math.max(time + attack + 0.01, time + safeDuration);
+          const endTime = holdEnd + release;
+
+          env.gain.setValueAtTime(0.0001, time);
+          env.gain.linearRampToValueAtTime(peak, time + attack);
+          env.gain.setValueAtTime(peak * 0.88, holdEnd);
+          env.gain.exponentialRampToValueAtTime(0.0001, endTime);
+
+          src.connect(env);
+          env.connect(getBassBus());
+
+          src.start(time, 0.003);
+          src.stop(endTime + 0.03);
+          trackAudioNode(src);
+          return;
+        }
+
+        // Fallback: synteza kontrabasu kierowana przez szynę getBassBus()
+        const freq = 440 * Math.pow(2, (midiPitch - 69) / 12);
         const osc = ctx.createOscillator();
         osc.type = 'triangle';
         osc.frequency.setValueAtTime(freq, time);
@@ -2536,47 +3103,30 @@
         lowpass.frequency.setValueAtTime(340, time);
         lowpass.Q.setValueAtTime(1.2, time);
 
-        const bodyRes = ctx.createBiquadFilter();
-        bodyRes.type = 'peaking';
-        bodyRes.frequency.setValueAtTime(115, time);
-        bodyRes.Q.setValueAtTime(1.8, time);
-        bodyRes.gain.setValueAtTime(4.0, time);
-
         const env = ctx.createGain();
-        const targetVol = 0.52;
-        const attack = Math.min(0.015, safeDuration * 0.1);
+        const targetVol = 0.54 * vel;
+        const attack = Math.min(0.014, safeDuration * 0.1);
         const decay = Math.min(0.16, safeDuration * 0.5);
 
         env.gain.setValueAtTime(0.0001, time);
         env.gain.linearRampToValueAtTime(targetVol, time + attack);
         if (safeDuration > decay + 0.03 && decay > attack + 0.01) {
-          env.gain.exponentialRampToValueAtTime(targetVol * 0.55, time + decay);
+          env.gain.exponentialRampToValueAtTime(Math.max(0.0002, targetVol * 0.55), time + decay);
         }
-        env.gain.exponentialRampToValueAtTime(0.0001, time + Math.max(attack + 0.01, safeDuration));
+        env.gain.exponentialRampToValueAtTime(0.0001, time + Math.max(attack + 0.015, safeDuration));
 
         osc.connect(lowpass);
         subOsc.connect(lowpass);
-        lowpass.connect(bodyRes);
-        bodyRes.connect(env);
-        env.connect(getAccompanimentBus());
+        lowpass.connect(env);
+        env.connect(getBassBus());
 
         const stopTime = time + safeDuration + 0.05;
         osc.start(time);
         subOsc.start(time);
         osc.stop(stopTime);
         subOsc.stop(stopTime);
-
-        const trackNode = (n) => {
-          activeAudioNodes.push(n);
-          n.onended = () => {
-            try { n.disconnect(); } catch (e) {}
-            const idx = activeAudioNodes.indexOf(n);
-            if (idx !== -1) activeAudioNodes.splice(idx, 1);
-          };
-        };
-
-        trackNode(osc);
-        trackNode(subOsc);
+        trackAudioNode(osc);
+        trackAudioNode(subOsc);
       } catch (err) {
         console.warn('playJazzBassNote warning:', err);
       }
@@ -2587,54 +3137,47 @@
     let hammondPeriodicWave = null;
     let organKeyClickBuffer = null;
 
-    // Próbka mechanicznego kliku styków klawiatury Hammonda (Key Click Transient)
     function getOrganKeyClickBuffer(ctx) {
       if (!organKeyClickBuffer) {
         const sr = ctx.sampleRate;
-        const len = Math.floor(sr * 0.006); // 6ms próbka kliku mechanicznego
+        const len = Math.floor(sr * 0.006);
         organKeyClickBuffer = ctx.createBuffer(1, len, sr);
         const data = organKeyClickBuffer.getChannelData(0);
         for (let i = 0; i < len; i++) {
           const t = i / len;
-          // Klik 9 szyn kontaktowych: ukształtowany szum pasmowy
           data[i] = ((Math.random() * 2 - 1) * Math.sin(t * Math.PI * 4)) * Math.exp(-t * 7);
         }
       }
       return organKeyClickBuffer;
     }
 
-    // Tablica addytywna 6 drawbarów Hammonda (Jimmy Smith 88 8420 000 Jazz Groover)
     function getHammondPeriodicWave(ctx) {
       if (!hammondPeriodicWave) {
         const numHarmonics = 12;
         const real = new Float32Array(numHarmonics);
         const imag = new Float32Array(numHarmonics);
-        // Częstotliwość bazowa to sub-oktawa (16' = harmonia 1)
-        imag[1] = 0.85; // 16' (sub-octave f/2)
-        imag[2] = 1.00; // 8' (fundamental f)
-        imag[3] = 0.72; // 5 1/3' (quint 1.5f)
-        imag[4] = 0.48; // 4' (octave 2f)
-        imag[6] = 0.28; // 2 2/3' (nazard 3f)
-        imag[8] = 0.18; // 2' (blockflöte 4f)
+        imag[1] = 0.85;
+        imag[2] = 1.00;
+        imag[3] = 0.72;
+        imag[4] = 0.48;
+        imag[6] = 0.28;
+        imag[8] = 0.18;
         hammondPeriodicWave = ctx.createPeriodicWave(real, imag, { disableNormalization: false });
       }
       return hammondPeriodicWave;
     }
 
-    // Fizyczny model wirującego głośnika Leslie 122 (Rotary Horn + Bass Rotor + Tube Preamp)
     function getLeslieSpeaker() {
       const ctx = getAudioContext();
       if (!leslieSpeakerGraph) {
         const input = ctx.createGain();
         input.gain.setValueAtTime(1.0, ctx.currentTime);
 
-        // Ciepłe lampowe nasycenie końcówki mocy wzmacniacza Leslie 122
         const tubeShaper = ctx.createWaveShaper();
         tubeShaper.curve = getSoftClipCurve();
         tubeShaper.oversample = '2x';
         input.connect(tubeShaper);
 
-        // Zwrotnica pasmowa (Crossover ~750 Hz)
         const hornCrossover = ctx.createBiquadFilter();
         hornCrossover.type = 'highpass';
         hornCrossover.frequency.setValueAtTime(750, ctx.currentTime);
@@ -2648,60 +3191,55 @@
         tubeShaper.connect(hornCrossover);
         tubeShaper.connect(drumCrossover);
 
-        // --- GÓRNY WIRUJĄCY TUBUS (ROTARY HORN - 6.2 Hz tremolo & doppler vibrato) ---
         const hornDelay = ctx.createDelay(0.02);
         hornDelay.delayTime.setValueAtTime(0.0035, ctx.currentTime);
 
         const hornGain = ctx.createGain();
         hornGain.gain.setValueAtTime(0.85, ctx.currentTime);
 
-        // LFO dla górnej tuby Leslie (Doppler pitch modulation)
         const hornPitchLFO = ctx.createOscillator();
-        hornPitchLFO.frequency.setValueAtTime(6.2, ctx.currentTime);
+        hornPitchLFO.frequency.setValueAtTime(6.0, ctx.currentTime);
         const hornPitchLFOGain = ctx.createGain();
-        hornPitchLFOGain.gain.setValueAtTime(0.0011, ctx.currentTime); // ±1.1ms Doppler
+        hornPitchLFOGain.gain.setValueAtTime(0.0010, ctx.currentTime);
         hornPitchLFO.connect(hornPitchLFOGain);
         hornPitchLFOGain.connect(hornDelay.delayTime);
 
-        // LFO dla tremolo amplitudy górnej tuby
         const hornAmpLFO = ctx.createOscillator();
-        hornAmpLFO.frequency.setValueAtTime(6.2, ctx.currentTime);
+        hornAmpLFO.frequency.setValueAtTime(6.0, ctx.currentTime);
         const hornAmpLFOGain = ctx.createGain();
-        hornAmpLFOGain.gain.setValueAtTime(0.24, ctx.currentTime);
+        hornAmpLFOGain.gain.setValueAtTime(0.22, ctx.currentTime);
         hornAmpLFO.connect(hornAmpLFOGain);
         hornAmpLFOGain.connect(hornGain.gain);
 
         hornCrossover.connect(hornDelay);
         hornDelay.connect(hornGain);
 
-        // --- DOLNY WIRUJĄCY BĘBEN (BASS DRUM ROTOR - 5.6 Hz) ---
         const drumGain = ctx.createGain();
         drumGain.gain.setValueAtTime(0.9, ctx.currentTime);
         const drumLFO = ctx.createOscillator();
-        drumLFO.frequency.setValueAtTime(5.6, ctx.currentTime);
+        drumLFO.frequency.setValueAtTime(5.4, ctx.currentTime);
         const drumLFOGain = ctx.createGain();
-        drumLFOGain.gain.setValueAtTime(0.16, ctx.currentTime);
+        drumLFOGain.gain.setValueAtTime(0.15, ctx.currentTime);
         drumLFO.connect(drumLFOGain);
         drumLFOGain.connect(drumGain.gain);
 
         drumCrossover.connect(drumGain);
 
-        // Drewniana skrzynia rezonansowa Leslie (peaking 480 Hz + lowpass 5400 Hz)
         const cabResonance = ctx.createBiquadFilter();
         cabResonance.type = 'peaking';
         cabResonance.frequency.setValueAtTime(480, ctx.currentTime);
         cabResonance.Q.setValueAtTime(1.4, ctx.currentTime);
-        cabResonance.gain.setValueAtTime(3.2, ctx.currentTime);
+        cabResonance.gain.setValueAtTime(2.8, ctx.currentTime);
 
         const cabHighCut = ctx.createBiquadFilter();
         cabHighCut.type = 'lowpass';
-        cabHighCut.frequency.setValueAtTime(5400, ctx.currentTime);
+        cabHighCut.frequency.setValueAtTime(5200, ctx.currentTime);
         cabHighCut.Q.setValueAtTime(0.9, ctx.currentTime);
 
         hornGain.connect(cabResonance);
         drumGain.connect(cabResonance);
         cabResonance.connect(cabHighCut);
-        cabHighCut.connect(getAccompanimentBus());
+        cabHighCut.connect(getCompBus());
 
         hornPitchLFO.start(ctx.currentTime);
         hornAmpLFO.start(ctx.currentTime);
@@ -2718,161 +3256,213 @@
       return leslieSpeakerGraph;
     }
 
-    // --- SYNTEZATOR JAZZOWYCH VOICINGÓW AKORDOWYCH (ORGANY HAMMONDA B-3 / RHODES / FREDDIE GREEN) ---
-    function playJazzCompingChord(midis, startTime, duration = 1.0, isPerch = false) {
+    // --- JAZZOWY COMPING AKORDOWY (STUDYJNIE SAMPLOWANY HAMMOND B-3 / RHODES / FREDDIE GREEN) ---
+    function playJazzCompingChord(midis, startTime, duration = 1.0, isPerch = false, velocity = 0.85) {
       if (!state.accompEnabled || !midis || midis.length === 0) return;
       try {
         const ctx = getAudioContext();
         const time = Math.max(ctx.currentTime, startTime);
         const safeDuration = Math.max(0.06, duration);
+        const vel = Math.max(0.35, Math.min(1.1, velocity));
 
         const isHammond = state.accompStyle === 'hammond' || state.accompStyle === 'sustain';
         const isFreddie = state.accompStyle === 'freddie';
         const leslie = isHammond ? getLeslieSpeaker() : null;
 
         midis.forEach((pitch, i) => {
-          // Humanizowany mikro-rozrzut palców organisty / gitarzysty (6ms dla organów, 11ms dla gitary)
-          const voiceTime = time + i * (isHammond ? 0.007 : 0.011);
+          const voiceTime = time + i * (isHammond ? 0.006 : (isFreddie ? 0.009 : 0.010));
           const freq = 440 * Math.pow(2, (pitch - 69) / 12);
 
-          const trackNode = (n) => {
-            activeAudioNodes.push(n);
-            n.onended = () => {
-              try { n.disconnect(); } catch (e) {}
-              const idx = activeAudioNodes.indexOf(n);
-              if (idx !== -1) activeAudioNodes.splice(idx, 1);
-            };
-          };
-
           if (isHammond) {
-            // === BRZMIENIE ORGANÓW HAMMONDA B-3 Z LESLIE 122 ===
-            const organOsc = ctx.createOscillator();
-            organOsc.setPeriodicWave(getHammondPeriodicWave(ctx));
-            organOsc.frequency.setValueAtTime(freq / 2, voiceTime); // Baza sub-oktawa dla drawbarów
+            const organSample = getClosestStudioSample('hammond_organ', pitch);
+            const organVol = (isPerch ? 0.22 : 0.28) * vel;
+            const attack = 0.004;
+            const release = Math.min(0.06, safeDuration * 0.22);
+            const sustainEnd = Math.max(voiceTime + attack + 0.004, voiceTime + safeDuration - release);
+            const noteEnd = Math.max(sustainEnd + 0.008, voiceTime + safeDuration);
 
-            const organEnv = ctx.createGain();
-            const organVol = isPerch ? 0.20 : 0.24;
-            const attack = 0.003; // B-3 ma natychmiastowy styk klawisza
-            const release = Math.min(0.05, safeDuration * 0.2);
-            const sustainEnd = Math.max(voiceTime + attack + 0.002, voiceTime + safeDuration - release);
-            const noteEnd = Math.max(sustainEnd + 0.004, voiceTime + safeDuration);
+            if (organSample) {
+              const src = ctx.createBufferSource();
+              src.buffer = organSample.buffer;
+              src.playbackRate.setValueAtTime(organSample.playbackRate, voiceTime);
 
-            organEnv.gain.setValueAtTime(0.0001, voiceTime);
-            organEnv.gain.linearRampToValueAtTime(organVol, voiceTime + attack);
-            organEnv.gain.setValueAtTime(organVol, sustainEnd);
-            organEnv.gain.exponentialRampToValueAtTime(0.0001, noteEnd);
+              const env = ctx.createGain();
+              env.gain.setValueAtTime(0.0001, voiceTime);
+              env.gain.linearRampToValueAtTime(organVol, voiceTime + attack);
+              env.gain.setValueAtTime(organVol, sustainEnd);
+              env.gain.exponentialRampToValueAtTime(0.0001, noteEnd);
 
-            organOsc.connect(organEnv);
-            organEnv.connect(leslie.input);
+              src.connect(env);
+              env.connect(leslie.input);
+              src.start(voiceTime, 0.005);
+              src.stop(noteEnd + 0.04);
+              trackAudioNode(src);
+            } else {
+              const organOsc = ctx.createOscillator();
+              organOsc.setPeriodicWave(getHammondPeriodicWave(ctx));
+              organOsc.frequency.setValueAtTime(freq / 2, voiceTime);
 
-            const stopTime = voiceTime + safeDuration + 0.05;
-            organOsc.start(voiceTime);
-            organOsc.stop(stopTime);
-            trackNode(organOsc);
+              const organEnv = ctx.createGain();
+              organEnv.gain.setValueAtTime(0.0001, voiceTime);
+              organEnv.gain.linearRampToValueAtTime(organVol * 0.85, voiceTime + attack);
+              organEnv.gain.setValueAtTime(organVol * 0.85, sustainEnd);
+              organEnv.gain.exponentialRampToValueAtTime(0.0001, noteEnd);
 
-            // Mechaniczny klik klawiszy (Key Click) na początku akordu
+              organOsc.connect(organEnv);
+              organEnv.connect(leslie.input);
+              organOsc.start(voiceTime);
+              organOsc.stop(noteEnd + 0.04);
+              trackAudioNode(organOsc);
+            }
+
             if (i === 0) {
               const clickSrc = ctx.createBufferSource();
               clickSrc.buffer = getOrganKeyClickBuffer(ctx);
               const clickGain = ctx.createGain();
-              clickGain.gain.setValueAtTime(0.14, voiceTime);
+              clickGain.gain.setValueAtTime(0.11 * vel, voiceTime);
               clickSrc.connect(clickGain);
               clickGain.connect(leslie.input);
               clickSrc.start(voiceTime);
-              trackNode(clickSrc);
+              trackAudioNode(clickSrc);
             }
 
-            // 3rd Harmonic Percussion (klasyczna jazzowa perkusja B-3 dla najwyższego głosu akordu)
             if (i === midis.length - 1 && !isPerch) {
               const percOsc = ctx.createOscillator();
               percOsc.type = 'sine';
               percOsc.frequency.setValueAtTime(freq * 3, voiceTime);
-
               const percEnv = ctx.createGain();
               percEnv.gain.setValueAtTime(0.0001, voiceTime);
-              percEnv.gain.linearRampToValueAtTime(0.12, voiceTime + 0.002);
-              percEnv.gain.exponentialRampToValueAtTime(0.0001, voiceTime + 0.14); // Szybki zanik perkusji
-
+              percEnv.gain.linearRampToValueAtTime(0.10 * vel, voiceTime + 0.002);
+              percEnv.gain.exponentialRampToValueAtTime(0.0001, voiceTime + 0.14);
               percOsc.connect(percEnv);
               percEnv.connect(leslie.input);
-
               percOsc.start(voiceTime);
               percOsc.stop(voiceTime + 0.16);
-              trackNode(percOsc);
+              trackAudioNode(percOsc);
             }
-
           } else if (isFreddie) {
-            // === BRZMIENIE GITARY RYTMICZNEJ FREDDIE GREEN (4/4 CHOP CHORD) ===
-            const osc = ctx.createOscillator();
-            osc.type = 'triangle';
-            osc.frequency.setValueAtTime(freq, voiceTime);
+            const chopDur = Math.min(0.22, safeDuration * 0.82);
+            const gSample = getClosestStudioSample('freddie_guitar', pitch);
+            if (gSample) {
+              const src = ctx.createBufferSource();
+              src.buffer = gSample.buffer;
+              src.playbackRate.setValueAtTime(gSample.playbackRate, voiceTime);
 
-            const chopFilter = ctx.createBiquadFilter();
-            chopFilter.type = 'bandpass';
-            chopFilter.frequency.setValueAtTime(650, voiceTime);
-            chopFilter.Q.setValueAtTime(1.8, voiceTime);
+              const chopFilter = ctx.createBiquadFilter();
+              chopFilter.type = 'bandpass';
+              chopFilter.frequency.setValueAtTime(860, voiceTime);
+              chopFilter.Q.setValueAtTime(1.1, voiceTime);
 
-            const chopEnv = ctx.createGain();
-            const chopDur = Math.min(0.20, safeDuration * 0.8);
-            chopEnv.gain.setValueAtTime(0.0001, voiceTime);
-            chopEnv.gain.linearRampToValueAtTime(0.26, voiceTime + 0.006);
-            chopEnv.gain.exponentialRampToValueAtTime(0.0001, voiceTime + chopDur);
+              const chopEnv = ctx.createGain();
+              const peak = 0.42 * vel;
+              chopEnv.gain.setValueAtTime(0.0001, voiceTime);
+              chopEnv.gain.linearRampToValueAtTime(peak, voiceTime + 0.005);
+              chopEnv.gain.exponentialRampToValueAtTime(0.0001, voiceTime + Math.max(0.03, chopDur));
 
-            osc.connect(chopFilter);
-            chopFilter.connect(chopEnv);
-            chopEnv.connect(getAccompanimentBus());
+              src.connect(chopFilter);
+              chopFilter.connect(chopEnv);
+              chopEnv.connect(getCompBus());
+              src.start(voiceTime, 0.004);
+              src.stop(voiceTime + chopDur + 0.03);
+              trackAudioNode(src);
+            } else {
+              const osc = ctx.createOscillator();
+              osc.type = 'triangle';
+              osc.frequency.setValueAtTime(freq, voiceTime);
+              const chopFilter = ctx.createBiquadFilter();
+              chopFilter.type = 'bandpass';
+              chopFilter.frequency.setValueAtTime(680, voiceTime);
+              chopFilter.Q.setValueAtTime(1.6, voiceTime);
 
-            osc.start(voiceTime);
-            osc.stop(voiceTime + chopDur + 0.02);
-            trackNode(osc);
+              const chopEnv = ctx.createGain();
+              chopEnv.gain.setValueAtTime(0.0001, voiceTime);
+              chopEnv.gain.linearRampToValueAtTime(0.26 * vel, voiceTime + 0.006);
+              chopEnv.gain.exponentialRampToValueAtTime(0.0001, voiceTime + Math.max(0.03, chopDur));
 
+              osc.connect(chopFilter);
+              chopFilter.connect(chopEnv);
+              chopEnv.connect(getCompBus());
+              osc.start(voiceTime);
+              osc.stop(voiceTime + chopDur + 0.03);
+              trackAudioNode(osc);
+            }
           } else {
-            // === BRZMIENIE FENDER RHODES / JAZZ PIANO (SWING COMPING) ===
-            const osc1 = ctx.createOscillator();
-            osc1.type = 'triangle';
-            osc1.frequency.setValueAtTime(freq, voiceTime);
+            // Fender Rhodes / Jazz Piano (Swing Comping)
+            const epSample = getClosestStudioSample('rhodes_piano', pitch);
+            if (epSample) {
+              const src = ctx.createBufferSource();
+              src.buffer = epSample.buffer;
+              src.playbackRate.setValueAtTime(epSample.playbackRate, voiceTime);
 
-            const osc2 = ctx.createOscillator();
-            osc2.type = 'sine';
-            osc2.frequency.setValueAtTime(freq * 2, voiceTime);
+              const warmth = ctx.createBiquadFilter();
+              warmth.type = 'lowpass';
+              warmth.frequency.setValueAtTime(1600 + vel * 1200, voiceTime);
+              warmth.Q.setValueAtTime(0.7, voiceTime);
 
-            const osc2Gain = ctx.createGain();
-            osc2Gain.gain.setValueAtTime(0.12, voiceTime);
-            osc2.connect(osc2Gain);
+              const env = ctx.createGain();
+              const peak = (isPerch ? 0.30 : 0.36) * vel;
+              const attack = Math.min(0.006, safeDuration * 0.1);
+              const release = Math.min(0.11, safeDuration * 0.32);
+              const holdEnd = Math.max(voiceTime + attack + 0.01, voiceTime + safeDuration);
+              const endTime = holdEnd + release;
 
-            const filter = ctx.createBiquadFilter();
-            filter.type = 'lowpass';
-            filter.frequency.setValueAtTime(1150, voiceTime);
-            const filterRampTime = voiceTime + safeDuration * 0.85;
-            if (filterRampTime > voiceTime + 0.01) {
-              filter.frequency.exponentialRampToValueAtTime(650, filterRampTime);
+              env.gain.setValueAtTime(0.0001, voiceTime);
+              env.gain.linearRampToValueAtTime(peak, voiceTime + attack);
+              env.gain.setValueAtTime(peak * 0.88, holdEnd);
+              env.gain.exponentialRampToValueAtTime(0.0001, endTime);
+
+              src.connect(warmth);
+              warmth.connect(env);
+              env.connect(getCompBus());
+              src.start(voiceTime, 0.002);
+              src.stop(endTime + 0.04);
+              trackAudioNode(src);
+            } else {
+              const osc1 = ctx.createOscillator();
+              osc1.type = 'triangle';
+              osc1.frequency.setValueAtTime(freq, voiceTime);
+
+              const osc2 = ctx.createOscillator();
+              osc2.type = 'sine';
+              osc2.frequency.setValueAtTime(freq * 2, voiceTime);
+
+              const osc2Gain = ctx.createGain();
+              osc2Gain.gain.setValueAtTime(0.12, voiceTime);
+              osc2.connect(osc2Gain);
+
+              const filter = ctx.createBiquadFilter();
+              filter.type = 'lowpass';
+              filter.frequency.setValueAtTime(1150, voiceTime);
+              const filterRampTime = voiceTime + safeDuration * 0.85;
+              if (filterRampTime > voiceTime + 0.01) {
+                filter.frequency.exponentialRampToValueAtTime(650, filterRampTime);
+              }
+
+              const env = ctx.createGain();
+              const chordVol = (isPerch ? 0.22 : 0.26) * vel;
+              const attack = Math.min(0.012, safeDuration * 0.1);
+              const decay = Math.min(0.16, safeDuration * 0.5);
+
+              env.gain.setValueAtTime(0.0001, voiceTime);
+              env.gain.linearRampToValueAtTime(chordVol, voiceTime + attack);
+              if (safeDuration > decay + 0.03 && decay > attack + 0.01) {
+                env.gain.exponentialRampToValueAtTime(Math.max(0.0002, chordVol * 0.58), voiceTime + decay);
+              }
+              env.gain.exponentialRampToValueAtTime(0.0001, voiceTime + Math.max(attack + 0.015, safeDuration));
+
+              osc1.connect(filter);
+              osc2Gain.connect(filter);
+              filter.connect(env);
+              env.connect(getCompBus());
+
+              const stopTime = voiceTime + safeDuration + 0.05;
+              osc1.start(voiceTime);
+              osc2.start(voiceTime);
+              osc1.stop(stopTime);
+              osc2.stop(stopTime);
+              trackAudioNode(osc1);
+              trackAudioNode(osc2);
             }
-
-            const env = ctx.createGain();
-            const chordVol = isPerch ? 0.22 : 0.26;
-            const attack = Math.min(0.012, safeDuration * 0.1);
-            const decay = Math.min(0.16, safeDuration * 0.5);
-
-            env.gain.setValueAtTime(0.0001, voiceTime);
-            env.gain.linearRampToValueAtTime(chordVol, voiceTime + attack);
-            if (safeDuration > decay + 0.03 && decay > attack + 0.01) {
-              env.gain.exponentialRampToValueAtTime(chordVol * 0.58, voiceTime + decay);
-            }
-            env.gain.exponentialRampToValueAtTime(0.0001, voiceTime + Math.max(attack + 0.01, safeDuration));
-
-            osc1.connect(filter);
-            osc2Gain.connect(filter);
-            filter.connect(env);
-            env.connect(getAccompanimentBus());
-
-            const stopTime = voiceTime + safeDuration + 0.05;
-            osc1.start(voiceTime);
-            osc2.start(voiceTime);
-            osc1.stop(stopTime);
-            osc2.stop(stopTime);
-
-            trackNode(osc1);
-            trackNode(osc2);
           }
         });
       } catch (err) {
@@ -2880,10 +3470,10 @@
       }
     }
 
-    // --- SYNTEZATOR JAZZOWEGO PULSU HI-HATU (BEATS 2 & 4 SWING SNAP) ---
+    // --- STUDYJNA PERKUSJA JAZZOWA (RIDE CYMBAL "SPANG-A-LANG", HI-HAT CHICK, BOSSA RIMSHOT) ---
     function getNoiseBuffer(ctx) {
       if (!noiseBuffer) {
-        const bufferSize = Math.floor(ctx.sampleRate * 0.08); // 80ms white noise
+        const bufferSize = Math.floor(ctx.sampleRate * 0.42); // 420ms dla szumu talerza Ride i Hi-Hatu
         noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
         const output = noiseBuffer.getChannelData(0);
         for (let i = 0; i < bufferSize; i++) {
@@ -2893,42 +3483,212 @@
       return noiseBuffer;
     }
 
-    function playJazzHiHat(startTime) {
+    // Turecki jazzowy talerz Ride (metaliczne składowe nieharmoniczne + szum wash + ping pałeczki)
+    function playJazzRideCymbal(startTime, velocity = 0.85, isSkip = false) {
       if (!state.hihatEnabled || !state.accompEnabled) return;
-      const ctx = getAudioContext();
-      const time = Math.max(ctx.currentTime, startTime);
+      try {
+        const ctx = getAudioContext();
+        const time = Math.max(ctx.currentTime, startTime);
+        const vel = Math.max(0.3, Math.min(1.1, velocity));
+        const dur = isSkip ? 0.17 : 0.34;
 
-      const noise = ctx.createBufferSource();
-      noise.buffer = getNoiseBuffer(ctx);
+        // 1. Metaliczne nieharmoniczne alikwoty talerza (6 oscylatorów)
+        const ratios = [1.0, 1.342, 1.618, 2.071, 2.411, 2.937];
+        const baseFreq = 352;
 
-      const bandpass = ctx.createBiquadFilter();
-      bandpass.type = 'bandpass';
-      bandpass.frequency.setValueAtTime(8500, time);
-      bandpass.Q.setValueAtTime(3.2, time);
+        const metalHp = ctx.createBiquadFilter();
+        metalHp.type = 'highpass';
+        metalHp.frequency.setValueAtTime(3600, time);
+        metalHp.Q.setValueAtTime(0.8, time);
 
-      const env = ctx.createGain();
-      const hatVol = 0.12;
-      env.gain.setValueAtTime(0.0001, time);
-      env.gain.linearRampToValueAtTime(hatVol, time + 0.003);
-      env.gain.exponentialRampToValueAtTime(0.0001, time + 0.05);
+        const metalPeak = ctx.createBiquadFilter();
+        metalPeak.type = 'peaking';
+        metalPeak.frequency.setValueAtTime(5600, time);
+        metalPeak.Q.setValueAtTime(1.6, time);
+        metalPeak.gain.setValueAtTime(3.5, time);
 
-      noise.connect(bandpass);
-      bandpass.connect(env);
-      env.connect(getAccompanimentBus());
+        const metalEnv = ctx.createGain();
+        const metalVol = (isSkip ? 0.036 : 0.056) * vel;
+        metalEnv.gain.setValueAtTime(0.0001, time);
+        metalEnv.gain.linearRampToValueAtTime(metalVol, time + 0.002);
+        metalEnv.gain.exponentialRampToValueAtTime(0.0001, time + dur);
 
-      noise.start(time);
-      noise.stop(time + 0.055);
+        metalHp.connect(metalPeak);
+        metalPeak.connect(metalEnv);
+        metalEnv.connect(getDrumsBus());
 
-      activeAudioNodes.push(noise);
-      noise.onended = () => {
-        try { noise.disconnect(); } catch (e) {}
-        const idx = activeAudioNodes.indexOf(noise);
-        if (idx !== -1) activeAudioNodes.splice(idx, 1);
-      };
+        ratios.forEach((r) => {
+          const osc = ctx.createOscillator();
+          osc.type = 'square';
+          osc.frequency.setValueAtTime(baseFreq * r, time);
+          osc.connect(metalHp);
+          osc.start(time);
+          osc.stop(time + dur + 0.02);
+          trackAudioNode(osc);
+        });
+
+        // 2. Powietrzny szum talerza (cymbal shimmer wash)
+        const washNoise = ctx.createBufferSource();
+        washNoise.buffer = getNoiseBuffer(ctx);
+        const washBp = ctx.createBiquadFilter();
+        washBp.type = 'bandpass';
+        washBp.frequency.setValueAtTime(7900, time);
+        washBp.Q.setValueAtTime(1.3, time);
+
+        const washEnv = ctx.createGain();
+        const washVol = (isSkip ? 0.042 : 0.068) * vel;
+        washEnv.gain.setValueAtTime(0.0001, time);
+        washEnv.gain.linearRampToValueAtTime(washVol, time + 0.003);
+        washEnv.gain.exponentialRampToValueAtTime(0.0001, time + dur + 0.04);
+
+        washNoise.connect(washBp);
+        washBp.connect(washEnv);
+        washEnv.connect(getDrumsBus());
+        washNoise.start(time, 0, Math.min(0.4, dur + 0.05));
+        trackAudioNode(washNoise);
+
+        // 3. Drewniany ping końcówki pałeczki (stick definition)
+        const stickNoise = ctx.createBufferSource();
+        stickNoise.buffer = getNoiseBuffer(ctx);
+        const stickBp = ctx.createBiquadFilter();
+        stickBp.type = 'bandpass';
+        stickBp.frequency.setValueAtTime(2950, time);
+        stickBp.Q.setValueAtTime(4.2, time);
+
+        const stickEnv = ctx.createGain();
+        stickEnv.gain.setValueAtTime(0.0001, time);
+        stickEnv.gain.linearRampToValueAtTime((isSkip ? 0.07 : 0.11) * vel, time + 0.0015);
+        stickEnv.gain.exponentialRampToValueAtTime(0.0001, time + 0.016);
+
+        stickNoise.connect(stickBp);
+        stickBp.connect(stickEnv);
+        stickEnv.connect(getDrumsBus());
+        stickNoise.start(time, 0, 0.022);
+        trackAudioNode(stickNoise);
+      } catch (err) {
+        console.warn('playJazzRideCymbal warning:', err);
+      }
     }
 
-    // --- HARMONOGRAM AKOMPANIAMENTU DLA POJEDYNCZEGO TAKTU ---
-    function scheduleBarAccompaniment(chordBarStr, barStartTime, strongBeatCount, beatDuration, is34) {
+    function playJazzHiHat(startTime, velocity = 0.85, isBossaClosed = false) {
+      if (!state.hihatEnabled || !state.accompEnabled) return;
+      try {
+        const ctx = getAudioContext();
+        const time = Math.max(ctx.currentTime, startTime);
+        const vel = Math.max(0.3, Math.min(1.1, velocity));
+        const dur = isBossaClosed ? 0.032 : 0.052;
+
+        const noise = ctx.createBufferSource();
+        noise.buffer = getNoiseBuffer(ctx);
+
+        const highpass = ctx.createBiquadFilter();
+        highpass.type = 'highpass';
+        highpass.frequency.setValueAtTime(isBossaClosed ? 6800 : 5600, time);
+
+        const bandpass = ctx.createBiquadFilter();
+        bandpass.type = 'bandpass';
+        bandpass.frequency.setValueAtTime(isBossaClosed ? 9400 : 8200, time);
+        bandpass.Q.setValueAtTime(isBossaClosed ? 2.6 : 3.0, time);
+
+        const env = ctx.createGain();
+        const hatVol = (isBossaClosed ? 0.075 : 0.125) * vel;
+        env.gain.setValueAtTime(0.0001, time);
+        env.gain.linearRampToValueAtTime(hatVol, time + 0.0025);
+        env.gain.exponentialRampToValueAtTime(0.0001, time + dur);
+
+        noise.connect(highpass);
+        highpass.connect(bandpass);
+        bandpass.connect(env);
+        env.connect(getDrumsBus());
+
+        noise.start(time, 0, dur + 0.01);
+        trackAudioNode(noise);
+      } catch (err) {
+        console.warn('playJazzHiHat warning:', err);
+      }
+    }
+
+    // Drewniany Cross-Stick Rimshot dla rytmów Bossa Nova / Latin Jazz
+    function playBossaRimshot(startTime, velocity = 0.82) {
+      if (!state.hihatEnabled || !state.accompEnabled) return;
+      try {
+        const ctx = getAudioContext();
+        const time = Math.max(ctx.currentTime, startTime);
+        const vel = Math.max(0.35, Math.min(1.1, velocity));
+
+        const wood1 = ctx.createOscillator();
+        wood1.type = 'triangle';
+        wood1.frequency.setValueAtTime(430, time);
+        wood1.frequency.exponentialRampToValueAtTime(340, time + 0.035);
+
+        const wood2 = ctx.createOscillator();
+        wood2.type = 'sine';
+        wood2.frequency.setValueAtTime(1240, time);
+
+        const woodEnv = ctx.createGain();
+        woodEnv.gain.setValueAtTime(0.0001, time);
+        woodEnv.gain.linearRampToValueAtTime(0.14 * vel, time + 0.002);
+        woodEnv.gain.exponentialRampToValueAtTime(0.0001, time + 0.052);
+
+        wood1.connect(woodEnv);
+        wood2.connect(woodEnv);
+        woodEnv.connect(getDrumsBus());
+
+        wood1.start(time);
+        wood2.start(time);
+        wood1.stop(time + 0.06);
+        wood2.stop(time + 0.06);
+        trackAudioNode(wood1);
+        trackAudioNode(wood2);
+
+        const click = ctx.createBufferSource();
+        click.buffer = getNoiseBuffer(ctx);
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.setValueAtTime(1850, time);
+        bp.Q.setValueAtTime(3.2, time);
+        const cEnv = ctx.createGain();
+        cEnv.gain.setValueAtTime(0.0001, time);
+        cEnv.gain.linearRampToValueAtTime(0.16 * vel, time + 0.0015);
+        cEnv.gain.exponentialRampToValueAtTime(0.0001, time + 0.015);
+
+        click.connect(bp);
+        bp.connect(cEnv);
+        cEnv.connect(getDrumsBus());
+        click.start(time, 0, 0.02);
+        trackAudioNode(click);
+      } catch (err) {
+        console.warn('playBossaRimshot warning:', err);
+      }
+    }
+
+    function clampBassMidi(midi) {
+      let m = midi;
+      while (m < 33) m += 12;
+      while (m > 52) m -= 12;
+      return m;
+    }
+
+    // Wylicza chromatyczny półton prowadzący (chromatic approach) do prymy kolejnego akordu
+    function getChromaticBassApproach(prevMidi, targetRootMidi) {
+      const target = clampBassMidi(targetRootMidi);
+      if (target > prevMidi) return clampBassMidi(target - 1);
+      if (target < prevMidi) return clampBassMidi(target + 1);
+      return clampBassMidi(target - 1);
+    }
+
+    // --- HARMONOGRAM AKOMPANIAMENTU (WALKING BASS, VOICE LEADING, RIDE SWING & BOSSA NOVA) ---
+    function scheduleBarAccompaniment(
+      chordBarStr,
+      barStartTime,
+      strongBeatCount,
+      beatDuration,
+      is34,
+      nextBarChordStr = null,
+      isBossa = false,
+      barIndexInGroup = 0,
+      voicingMemory = null
+    ) {
       if (!chordBarStr) chordBarStr = 'C';
       const chordTokens = chordBarStr.trim().split(/\s+/).filter(Boolean);
       if (chordTokens.length === 0) chordTokens.push('C');
@@ -2959,56 +3719,141 @@
         });
       }
 
-      chordSlots.forEach(slot => {
+      const nextBarFirstChord = nextBarChordStr
+        ? (nextBarChordStr.trim().split(/\s+/).filter(Boolean)[0] || chordTokens[0])
+        : chordTokens[0];
+
+      chordSlots.forEach((slot, slotIdx) => {
         const chordStartTime = barStartTime + slot.startBeat * beatDuration;
         const chordDurationSec = slot.beatLen * beatDuration;
-        const voicing = getChordVoicing(slot.chord);
+        const prevMidis = voicingMemory ? voicingMemory.prevMidis : null;
+        const voicing = getVoiceLedChordVoicing(slot.chord, prevMidis);
+        if (voicingMemory) {
+          voicingMemory.prevMidis = voicing.chordMidis;
+        }
+
+        const nextChordStr = (slotIdx + 1 < chordSlots.length)
+          ? chordSlots[slotIdx + 1].chord
+          : nextBarFirstChord;
+        const nextVoicing = getChordVoicing(nextChordStr);
+
+        const rootMidi = clampBassMidi(voicing.bassMidi);
+        const thirdMidi = clampBassMidi(rootMidi + (voicing.thirdInterval || 4));
+        const fifthMidi = clampBassMidi(rootMidi + (voicing.fifthInterval || 7));
+        const fifthDownMidi = clampBassMidi(rootMidi - 5);
 
         if (state.accompStyle === 'sustain') {
-          // Ciepłe pady harmoniczne - pełne wybrzmiewanie akordu
-          playJazzBassNote(voicing.bassMidi, chordStartTime, chordDurationSec * 0.95);
-          playJazzCompingChord(voicing.chordMidis, chordStartTime, chordDurationSec * 0.96);
-        } else if (state.accompStyle === 'freddie') {
-          // Freddie Green: puls ćwierćnutowy na 4 części taktu + walking bass
-          const beatsCount = Math.max(1, Math.floor(slot.beatLen));
-          for (let b = 0; b < beatsCount; b++) {
-            const bTime = chordStartTime + b * beatDuration;
-            const bassM = (b === 0) ? voicing.bassMidi : (voicing.bassMidi + (b % 2 === 1 ? 7 : 4));
-            playJazzBassNote(bassM, bTime, beatDuration * 0.85);
-            playJazzCompingChord(voicing.chordMidis, bTime, beatDuration * 0.45, true);
+          playJazzBassNote(rootMidi, chordStartTime, chordDurationSec * 0.94, 0.90);
+          playJazzCompingChord(voicing.chordMidis, chordStartTime, chordDurationSec * 0.96, false, 0.82);
+        } else if (isBossa) {
+          // === AUTENTYCZNY GROOVE BOSSA NOVA / LATIN JAZZ ===
+          if (slot.beatLen >= 3.5) {
+            playJazzBassNote(rootMidi, chordStartTime, beatDuration * 1.42, 0.96);
+            playJazzBassNote(fifthDownMidi, chordStartTime + 1.5 * beatDuration, beatDuration * 0.45, 0.76);
+            playJazzBassNote(fifthDownMidi, chordStartTime + 2.0 * beatDuration, beatDuration * 1.42, 0.88);
+            const bossaLead = getChromaticBassApproach(fifthDownMidi, nextVoicing.bassMidi);
+            playJazzBassNote(bossaLead, chordStartTime + 3.5 * beatDuration, beatDuration * 0.45, 0.74);
+
+            playJazzCompingChord(voicing.chordMidis, chordStartTime, beatDuration * 0.82, false, 0.86);
+            playJazzCompingChord(voicing.chordMidis, chordStartTime + 1.5 * beatDuration, beatDuration * 0.72, true, 0.72);
+            playJazzCompingChord(voicing.chordMidis, chordStartTime + 3.0 * beatDuration, beatDuration * 0.75, true, 0.78);
+          } else if (slot.beatLen >= 2.5) {
+            playJazzBassNote(rootMidi, chordStartTime, beatDuration * 1.42, 0.95);
+            playJazzBassNote(fifthDownMidi, chordStartTime + 1.5 * beatDuration, beatDuration * 0.45, 0.76);
+            playJazzBassNote(getChromaticBassApproach(fifthDownMidi, nextVoicing.bassMidi), chordStartTime + 2.0 * beatDuration, beatDuration * 0.90, 0.84);
+
+            playJazzCompingChord(voicing.chordMidis, chordStartTime, beatDuration * 0.82, false, 0.85);
+            playJazzCompingChord(voicing.chordMidis, chordStartTime + 1.5 * beatDuration, beatDuration * 0.75, true, 0.74);
+          } else if (slot.beatLen >= 1.5) {
+            playJazzBassNote(rootMidi, chordStartTime, beatDuration * 1.40, 0.94);
+            playJazzBassNote(fifthDownMidi, chordStartTime + 1.5 * beatDuration, beatDuration * 0.45, 0.78);
+            playJazzCompingChord(voicing.chordMidis, chordStartTime, beatDuration * 0.85, false, 0.84);
+          } else {
+            playJazzBassNote(rootMidi, chordStartTime, chordDurationSec * 0.90, 0.90);
+            playJazzCompingChord(voicing.chordMidis, chordStartTime, chordDurationSec * 0.82, true, 0.80);
           }
         } else {
-          // Domyślny styl: Jazz Swing (Charleston & Syncopations)
-          // 1. Bas na '1' (downbeat)
-          playJazzBassNote(voicing.bassMidi, chordStartTime, Math.min(chordDurationSec * 0.9, beatDuration * 1.8));
-
-          // Jeśli akord trwa cały takt (4 bity), dodaj drugi krok basowy na '3'
-          if (slot.beatLen >= 3.5) {
-            const altBass = voicing.bassMidi + 7;
-            const walkBass = altBass > 48 ? voicing.bassMidi - 5 : altBass;
-            playJazzBassNote(walkBass, chordStartTime + 2 * beatDuration, beatDuration * 1.8);
+          // === INTELIGENTNY WALKING BASS (PRYMA -> TERCJA -> KWINTA -> PÓŁTON CHROMATYCZNY) ===
+          const beatsCount = Math.max(1, Math.round(slot.beatLen));
+          const walkNotes = [];
+          if (beatsCount >= 4) {
+            const approach = getChromaticBassApproach(fifthMidi, nextVoicing.bassMidi);
+            walkNotes.push(rootMidi, thirdMidi, fifthMidi, approach);
+          } else if (beatsCount === 3) {
+            const midTone = (barIndexInGroup % 2 === 0) ? thirdMidi : fifthMidi;
+            const approach = getChromaticBassApproach(midTone, nextVoicing.bassMidi);
+            walkNotes.push(rootMidi, midTone, approach);
+          } else if (beatsCount === 2) {
+            const approach = getChromaticBassApproach(rootMidi, nextVoicing.bassMidi);
+            walkNotes.push(rootMidi, approach);
+          } else {
+            walkNotes.push(rootMidi);
           }
 
-          // 2. Akord na '1' (Organ / Rhodes swell)
-          const downbeatDur = Math.min(chordDurationSec * 0.90, beatDuration * (slot.beatLen >= 3 ? 1.6 : 1.35));
-          playJazzCompingChord(voicing.chordMidis, chordStartTime, downbeatDur);
+          walkNotes.forEach((bassMidi, bIdx) => {
+            const bTime = chordStartTime + bIdx * beatDuration;
+            const bVel = bIdx === 0 ? 0.96 : (bIdx === 2 ? 0.88 : 0.81);
+            playJazzBassNote(bassMidi, bTime, beatDuration * 0.92, bVel);
+          });
 
-          // 3. Synkopa Charleston na "2-i" w dłuższych akordach
-          if (slot.beatLen >= 3) {
-            const syncTime = chordStartTime + 1.66 * beatDuration;
-            playJazzCompingChord(voicing.chordMidis, syncTime, beatDuration * 0.90);
+          if (state.accompStyle === 'freddie') {
+            for (let b = 0; b < beatsCount; b++) {
+              const bTime = chordStartTime + b * beatDuration;
+              const absBeat = Math.round(slot.startBeat + b);
+              const chopVel = (absBeat % 2 === 1) ? 0.92 : 0.76; // Subtelny akcent na 2 i 4
+              playJazzCompingChord(voicing.chordMidis, bTime, beatDuration * 0.42, true, chopVel);
+            }
+          } else {
+            // Jazz Swing Comping (Hammond B-3 / Fender Rhodes - Charleston + synkopy)
+            const downbeatDur = Math.min(chordDurationSec * 0.88, beatDuration * (slot.beatLen >= 3 ? 1.48 : 1.25));
+            playJazzCompingChord(voicing.chordMidis, chordStartTime, downbeatDur, false, 0.86);
+
+            if (slot.beatLen >= 3) {
+              const syncTime = chordStartTime + 1.66 * beatDuration;
+              playJazzCompingChord(voicing.chordMidis, syncTime, beatDuration * 0.82, true, 0.74);
+
+              if (slot.beatLen >= 3.8 && barIndexInGroup % 2 === 1) {
+                const pushTime = chordStartTime + 3.66 * beatDuration;
+                playJazzCompingChord(voicing.chordMidis, pushTime, beatDuration * 0.30, true, 0.66);
+              }
+            }
           }
         }
       });
 
-      // Swingowy hi-hat na 2 i 4 (w 3/4 na 2 i 3)
+      // === PERKUSJA: SWING RIDE CYMBAL ("SPANG-A-LANG") + HI-HAT 2&4 LUB BOSSA GROOVE ===
       if (state.hihatEnabled) {
-        if (is34) {
-          playJazzHiHat(barStartTime + 1 * beatDuration);
-          playJazzHiHat(barStartTime + 2 * beatDuration);
+        if (isBossa) {
+          const eighthSteps = strongBeatCount * 2;
+          for (let e = 0; e < eighthSteps; e++) {
+            playJazzHiHat(barStartTime + e * 0.5 * beatDuration, e % 2 === 0 ? 0.64 : 0.42, true);
+          }
+          const rimBeats = is34
+            ? [0, 1.5]
+            : (barIndexInGroup % 2 === 0 ? [0, 1.5, 3.0] : [1.0, 2.5]);
+          rimBeats.forEach((rb) => {
+            playBossaRimshot(barStartTime + rb * beatDuration, rb === 0 ? 0.88 : 0.76);
+          });
+        } else if (is34) {
+          // Jazz Waltz 3/4: Ride + Hi-Hat chick na 2 i 3
+          playJazzRideCymbal(barStartTime + 0 * beatDuration, 0.84, false);
+          playJazzRideCymbal(barStartTime + 1 * beatDuration, 0.92, false);
+          playJazzRideCymbal(barStartTime + 1.66 * beatDuration, 0.62, true);
+          playJazzRideCymbal(barStartTime + 2 * beatDuration, 0.84, false);
+
+          playJazzHiHat(barStartTime + 1 * beatDuration, 0.86, false);
+          playJazzHiHat(barStartTime + 2 * beatDuration, 0.78, false);
         } else {
-          playJazzHiHat(barStartTime + 1 * beatDuration);
-          playJazzHiHat(barStartTime + 3 * beatDuration);
+          // Klasyczny Jazz Swing 4/4: Ride "spang-a-lang" (1, 2, 2&, 3, 4, 4&) + Hi-Hat chick na 2 i 4
+          playJazzRideCymbal(barStartTime + 0 * beatDuration, 0.84, false);
+          playJazzRideCymbal(barStartTime + 1 * beatDuration, 0.96, false);
+          playJazzRideCymbal(barStartTime + 1.66 * beatDuration, 0.62, true);
+          playJazzRideCymbal(barStartTime + 2 * beatDuration, 0.82, false);
+          playJazzRideCymbal(barStartTime + 3 * beatDuration, 0.96, false);
+          playJazzRideCymbal(barStartTime + 3.66 * beatDuration, 0.62, true);
+
+          playJazzHiHat(barStartTime + 1 * beatDuration, 0.92, false);
+          playJazzHiHat(barStartTime + 3 * beatDuration, 0.92, false);
         }
       }
     }
@@ -4169,6 +5014,8 @@
       if (ctx.state === 'suspended') {
         ctx.resume();
       }
+      // Upewnij się, że próbki dla bieżącego zestawu instrumentów są dekodowane w tle
+      preloadStudioSamplesForCurrentSetup(true);
 
       state.isPlaying = true;
       state.currentBarIndex = state.rangeStartBar;
@@ -4178,6 +5025,7 @@
       const beatDuration = 60 / bpm;
       const standard = getEffectiveStandard();
       const is34 = standard.timeSignature === '3/4';
+      const isBossa = /bossa|latin|samba/i.test(standard.style || '');
       const strongBeatCount = is34 ? 3 : 4;
       const barDuration = strongBeatCount * beatDuration;
 
@@ -4207,25 +5055,67 @@
       }
       syncPlayingBarUI(state.rangeStartBar);
 
-      // Budowa lekkiej osi czasu zdarzeń bez tworzenia węzłów audio z góry
-      const swingRatioFirst = 0.66;
-      const swingRatioSecond = 0.34;
+      // Budowa humanizowanej osi czasu zdarzeń (artykulacja legato, akcenty jazzowe, ghost notes, laid-back feel)
+      const swingRatioFirst = isBossa ? 0.50 : 0.66;
+      const swingRatioSecond = isBossa ? 0.50 : 0.34;
       const notes = state.currentGroupPhrase.allNotes;
       let currentTimeOffset = 0;
 
       const guitarEvents = notes.map((note, index) => {
-        const ratio = (typeof note.durationRatio === 'number')
-          ? note.durationRatio
-          : (note.isTriplet ? (1 / 3) : (index % 2 === 0 ? swingRatioFirst : swingRatioSecond));
+        let ratio;
+        if (note.isTriplet) {
+          ratio = 1 / 3;
+        } else if (isBossa) {
+          ratio = 0.50;
+        } else if (typeof note.durationRatio === 'number') {
+          ratio = note.durationRatio;
+        } else {
+          ratio = (index % 2 === 0 ? swingRatioFirst : swingRatioSecond);
+        }
+
         const noteDuration = beatDuration * ratio;
+        const prevNote = index > 0 ? notes[index - 1] : null;
+        const nextNote = index + 1 < notes.length ? notes[index + 1] : null;
+
+        // Automatyczna detekcja legato (hammer-on / pull-off na tej samej strunie w odległości 1-2 progów)
+        const isLegato = Boolean(
+          prevNote &&
+          prevNote.barIndex === note.barIndex &&
+          prevNote.stringNum === note.stringNum &&
+          Math.abs(note.fret - prevNote.fret) >= 1 &&
+          Math.abs(note.fret - prevNote.fret) <= 2
+        );
+
+        const isPhraseEnd = (index === notes.length - 1) || (noteDuration >= beatDuration * 0.85);
+
+        // Dynamiczne akcenty jazzowe: cichsze chromatyczne ghost notes, wyraziste swingowe off-beaty
+        let velocity = 0.88;
+        if (note.isPassing) {
+          velocity = 0.68 + Math.random() * 0.08;
+        } else if (note.beatType === 'weak' || (!note.isTriplet && index % 2 === 1)) {
+          velocity = (isBossa ? 0.84 : 0.95) + Math.random() * 0.08;
+        } else {
+          velocity = 0.85 + Math.random() * 0.09;
+        }
+        // Delikatny szczyt melodyczny przy zmianie kierunku konturu w górę
+        if (prevNote && nextNote && note.midi > prevNote.midi && note.midi >= nextNote.midi) {
+          velocity = Math.min(1.08, velocity + 0.06);
+        }
+
+        // Subtelny jazzowy pocket (laid-back micro-timing +6..13ms, bezpiecznie nie nachodzący na sąsiednie nuty)
+        const microDelay = index === 0 ? 0 : Math.min(0.013, 0.005 + Math.random() * 0.007);
         const ev = {
           midi: note.midi,
           timeOffset: currentTimeOffset,
-          duration: Math.max(0.04, noteDuration * 0.95),
+          audioOffset: currentTimeOffset + microDelay,
+          duration: Math.max(0.05, noteDuration * (isLegato ? 0.99 : 0.94)),
           barIndex: note.barIndex,
           stringNum: note.stringNum,
           fret: note.fret,
-          isPassing: note.isPassing
+          isPassing: note.isPassing,
+          velocity,
+          isLegato,
+          isPhraseEnd
         };
         currentTimeOffset += noteDuration;
         return ev;
@@ -4233,13 +5123,23 @@
 
       const accompEvents = [];
       if (state.accompEnabled && state.currentGroupPhrase.groupBars) {
-        state.currentGroupPhrase.groupBars.forEach((gb, barIdxInGroup) => {
+        const groupBars = state.currentGroupPhrase.groupBars;
+        groupBars.forEach((gb, barIdxInGroup) => {
+          const nextGb = groupBars[barIdxInGroup + 1];
+          const fallbackNextBar = standard.bars[gb.barIndex + 1];
+          const nextBarChord = nextGb
+            ? nextGb.chord
+            : (state.isLooping ? groupBars[0].chord : (fallbackNextBar ? fallbackNextBar.chord : gb.chord));
+
           accompEvents.push({
             chord: gb.chord,
+            nextBarChord,
             timeOffset: barIdxInGroup * barDuration,
             strongBeatCount: strongBeatCount,
             beatDuration: beatDuration,
-            is34: is34
+            is34: is34,
+            isBossa: isBossa,
+            barIndexInGroup: barIdxInGroup
           });
         });
       }
@@ -4260,6 +5160,7 @@
         scheduledGuitarIndex: 0,
         scheduledBarIndex: 0,
         visualNoteIndex: 0,
+        voicingMemory: { prevMidis: null },
         syncPlayingBarUI
       };
 
@@ -4274,16 +5175,21 @@
       const ctx = getAudioContext();
       const now = ctx.currentTime;
       const { startTimeBase, guitarEvents, accompEvents, totalDuration } = playbackTimeline;
-      const lookaheadWindow = 0.18; // 180ms wprzód: minimalizuje liczbę aktywnych węzłów audio do zaledwie kilku
+      const lookaheadWindow = 0.18;
 
       // 1. Harmonogramowanie nut gitary solowej w oknie lookahead
       while (
         playbackTimeline.scheduledGuitarIndex < guitarEvents.length &&
-        startTimeBase + guitarEvents[playbackTimeline.scheduledGuitarIndex].timeOffset <= now + lookaheadWindow
+        startTimeBase + guitarEvents[playbackTimeline.scheduledGuitarIndex].audioOffset <= now + lookaheadWindow
       ) {
         const ev = guitarEvents[playbackTimeline.scheduledGuitarIndex];
-        const targetAudioTime = startTimeBase + ev.timeOffset;
-        playJazzGuitarNote(ev.midi, targetAudioTime, ev.duration);
+        const targetAudioTime = startTimeBase + ev.audioOffset;
+        playJazzGuitarNote(ev.midi, targetAudioTime, ev.duration, {
+          velocity: ev.velocity,
+          isLegato: ev.isLegato,
+          isPhraseEnd: ev.isPhraseEnd,
+          isPassing: ev.isPassing
+        });
         playbackTimeline.scheduledGuitarIndex++;
       }
 
@@ -4295,7 +5201,17 @@
         ) {
           const bEv = accompEvents[playbackTimeline.scheduledBarIndex];
           const targetAudioTime = startTimeBase + bEv.timeOffset;
-          scheduleBarAccompaniment(bEv.chord, targetAudioTime, bEv.strongBeatCount, bEv.beatDuration, bEv.is34);
+          scheduleBarAccompaniment(
+            bEv.chord,
+            targetAudioTime,
+            bEv.strongBeatCount,
+            bEv.beatDuration,
+            bEv.is34,
+            bEv.nextBarChord,
+            bEv.isBossa,
+            bEv.barIndexInGroup,
+            playbackTimeline.voicingMemory
+          );
           playbackTimeline.scheduledBarIndex++;
         }
       }
@@ -4338,6 +5254,7 @@
           playbackTimeline.scheduledGuitarIndex = 0;
           playbackTimeline.scheduledBarIndex = 0;
           playbackTimeline.visualNoteIndex = 0;
+          playbackTimeline.voicingMemory = { prevMidis: null };
           state.currentBarIndex = state.rangeStartBar;
           if (playbackTimeline.syncPlayingBarUI) {
             playbackTimeline.syncPlayingBarUI(state.rangeStartBar);
@@ -4920,7 +5837,7 @@
           ? 'px-2 py-1 rounded-lg border border-cyan-500/40 bg-cyan-500/15 text-cyan-300 font-bold text-[11px] flex items-center gap-1 transition active:scale-95'
           : 'px-2 py-1 rounded-lg border border-slate-800 bg-slate-900 text-slate-500 font-bold text-[11px] flex items-center gap-1 transition active:scale-95';
       });
-      hihatTexts.forEach(txt => { if (txt) txt.textContent = state.hihatEnabled ? 'Hi-Hat: WŁ' : 'Hi-Hat: WYŁ'; });
+      hihatTexts.forEach(txt => { if (txt) txt.textContent = state.hihatEnabled ? 'Ride/Hat: WŁ' : 'Ride/Hat: WYŁ'; });
 
       const styleSelects = [document.getElementById('accompStyleSelect'), document.getElementById('accompStyleSelectTop')];
       styleSelects.forEach(sel => { if (sel) sel.value = state.accompStyle; });
@@ -4952,6 +5869,7 @@
           state.guitarTone = e.target.value;
           updateGuitarAmpChain();
           updateAccompanimentUI();
+          preloadStudioSamplesForCurrentSetup(Boolean(audioCtx));
         });
       }
     });
@@ -4997,6 +5915,7 @@
         sel.addEventListener('change', (e) => {
           state.accompStyle = e.target.value;
           updateAccompanimentUI();
+          preloadStudioSamplesForCurrentSetup(Boolean(audioCtx));
         });
       }
     });
@@ -5281,12 +6200,24 @@
     window.addEventListener('offline', updateOnlineStatus);
     updateOnlineStatus();
 
-    // Rejestracja Service Workera
+    // Ciche pobranie w tle WSZYSTKICH 6 zestawów studyjnych próbek MP3 (100% pełny tryb offline)
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        preloadAllStudioSamples(false);
+      }, 350);
+    });
+
+    // Rejestracja Service Workera (z pełnym precache aplikacji + wszystkich 57 próbek studyjnych)
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
         navigator.serviceWorker.register('./sw.js')
           .then((reg) => {
             console.log('[PWA] Service Worker aktywny:', reg.scope);
+            if (navigator.serviceWorker.ready) {
+              navigator.serviceWorker.ready.then(() => {
+                preloadAllStudioSamples(false);
+              });
+            }
           })
           .catch((err) => {
             console.warn('[PWA] Rejestracja Service Workera nie powiodła się:', err);
